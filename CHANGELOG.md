@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- 安装方式：支持从 GitHub 获取（`dsh plugin add https://github.com/Re-s/dsh-memory-s3.git`），本地 `link:` 方式保留为开发选项（README §安装）
+
 ### 规划中（Initiation 完成）
 
 - 需求分析定稿（docs/requirements.md）

@@ -24,11 +24,27 @@
 
 ### 安装
 
-```bash
-# 本地开发
-dsh plugin --profile web add "link:/path/to/dsh-memory-s3"
+从 GitHub 获取（推荐，pnpm 语法，`dsh plugin add` 透传）：
 
-# 配置环境变量（S3 凭据）
+```bash
+# 方式一：HTTPS 直接安装
+dsh plugin --profile web add https://github.com/Re-s/dsh-memory-s3.git
+
+# 方式二：指定分支（如 main）/ tag / commit
+dsh plugin --profile web add https://github.com/Re-s/dsh-memory-s3.git#main
+
+# 方式三：SSH 方式（需配置 GitHub SSH key）
+dsh plugin --profile web add git@github.com:Re-s/dsh-memory-s3.git
+```
+
+本地开发（源码调试，link 方式）：
+
+```bash
+git clone https://github.com/Re-s/dsh-memory-s3.git
+dsh plugin --profile web add "link:/path/to/dsh-memory-s3"
+```
+
+配置环境变量（S3 凭据）：
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 export AWS_REGION=us-east-1
