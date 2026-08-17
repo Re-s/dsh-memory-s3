@@ -19,5 +19,9 @@
 ### Added
 
 - 项目骨架与全套文档（README/CONTRIBUTING/CHANGELOG/LICENSE/.editorconfig/.gitignore/.prettierrc）
-- 纯逻辑核心：`lib/entry.mjs`（条目模型 + 秘密检测）、`lib/vector.mjs`（余弦 top-k）、`lib/cache.mjs`（LRU 缓存）、`lib/audit.mjs`（审计账本）、`lib/gate.mjs`（审批 reason 编解码）、`lib/strings.mjs`（en/zh 词表）——57 测试全绿
-- S3 存储层与插件入口（进行中）：`lib/sigv4.mjs` / `lib/s3store.mjs` / `lib/embedder.mjs` / `index.mjs`
+- 纯逻辑核心：`lib/entry.mjs`（条目模型 + 秘密检测）、`lib/vector.mjs`（余弦 top-k）、`lib/cache.mjs`（LRU 缓存）、`lib/audit.mjs`（审计账本）、`lib/gate.mjs`（审批 reason 编解码）、`lib/strings.mjs`（en/zh 词表）
+- S3 存储层：`lib/sigv4.mjs`（最小 SigV4 签名器，零依赖）、`lib/s3store.mjs`（条件写 + 指数退避 + ListObjectsV2）
+- 嵌入器：`lib/embedder.mjs`（OpenAI 兼容 / Ollama / none 三 provider 可插拔）
+- 插件入口：`index.mjs`（MemoryS3Service + 9 工具 + 同步快照注入 + 审批 answerer + session/event 桥）
+- 类型契约：`types.d.ts`（ctx.memoryS3 声明合并）
+- 测试：8 个文件 105 例全绿（覆盖率行 96.07% / 分支 87.80% / 函数 95.50%）

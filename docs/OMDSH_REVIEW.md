@@ -25,11 +25,11 @@
 | lib/audit.mjs（审计账本 JSONL） | ✅ 完成 | 10 例 |
 | lib/gate.mjs（审批 reason 编解码） | ✅ 完成 | 9 例 |
 | lib/strings.mjs（en/zh 词表） | ✅ 完成 | （经 index 使用验证） |
-| lib/sigv4.mjs（SigV4 签名器） | ⏳ 实现中（实验体 D） | 计划 |
-| lib/s3store.mjs（S3 客户端） | ⏳ 实现中（实验体 D） | 计划（mock fetch） |
-| lib/embedder.mjs（嵌入器） | ⏳ 实现中（实验体 D） | 计划（mock fetch） |
-| index.mjs（插件入口：工具/注入/审批） | ⏳ 实现中（实验体 D） | 计划 |
-| 覆盖率（纯逻辑层） | ✅ 行 96.01% / 分支 92.86% / 函数 94.20% | 远超门 80/75/80 |
+| lib/sigv4.mjs（SigV4 签名器） | ✅ 完成 | 15 例 |
+| lib/s3store.mjs（S3 客户端，mock fetch） | ✅ 完成 | 8 例 |
+| lib/embedder.mjs（嵌入器，mock fetch） | ✅ 完成 | 8 例 |
+| index.mjs（插件入口：服务/工具/注入/审批） | ✅ 完成 | 13 例（mock ctx + mock fetch 集成） |
+| 覆盖率（lib/ 全模块） | ✅ 行 96.07% / 分支 87.80% / 函数 95.50% | 远超门 80/75/80 |
 
 ## 3. 安全维度（OMDSH 审查面）
 
