@@ -139,6 +139,21 @@ class MemoryS3Service {
       return { action: 'merged', entry: merged };
     }
 
+    // 查重未命中但缓存可能未同步（清缓存/首次启动未预热）→ 远端预检同 type 前缀，
+    // 防「S3 已有同 title 对象而本地缓存无」时创建重复条目（真实场景验证暴露）。
+    // 预检只列 key 不读 body，成本可控；命中同 title 则并入合并路径。
+    if (this.cache.listDiskIds().length === 0) {
+      const remoteSame = await this.#findRemoteByTitle(entry.type, entry.title);
+      if (remoteSame !== null) {
+        const { entry: merged } = await this.#updateExisting(remoteSame, {
+          content: entry.content,
+          tags: entry.tags,
+          importance: entry.importance,
+        }, write);
+        return { action: 'merged', entry: merged };
+      }
+    }
+
     await this.#tryEmbed(entry);
     await this.#askApproval({
       action: 'save',
@@ -208,6 +223,8 @@ class MemoryS3Service {
     this.#throwIfAborted(write);
     await this.s3.deleteObject(this.s3.keyOf(existing.type, existing.id));
     this.deleted.add(existing.id);
+    // 同步清本地缓存（内存+磁盘）：否则磁盘残留会在新进程回源时复活（真实场景验证暴露）。
+    this.cache.deleteEntry(existing.id);
     this.#auditWrite('remove', existing, write, {});
     return { entry: existing };
   }
@@ -352,7 +369,7 @@ class MemoryS3Service {
     return {
       configured: this.config.configured,
       sync: this.#syncState(),
-      cachedEntries: this.cache.listLocalIds().length,
+      cachedEntries: this.cache.listDiskIds().length,
       embedder: this.embedder.name,
       cacheDir: this.config.cacheDir,
     };
@@ -400,7 +417,9 @@ class MemoryS3Service {
       Array.isArray(filter.tags) && filter.tags.length > 0 ? filter.tags.map((t) => String(t).toLowerCase()) : null;
     const importanceMin = filter.importanceMin;
     const out = [];
-    for (const id of this.cache.listLocalIds()) {
+    // 磁盘+内存并集遍历：跨进程时热层为空，磁盘条目必须可读（快照/检索的持久化基础）。
+    const ids = new Set([...this.cache.listDiskIds(), ...this.cache.listLocalIds()]);
+    for (const id of ids) {
       if (this.deleted.has(id)) continue;
       const entry = this.cache.getEntry(id);
       if (entry === null) continue;
@@ -416,7 +435,8 @@ class MemoryS3Service {
 
   /** 同 (type, title) 去重预检（区分大小写，entry.mjs sameTitle 语义）。 */
   #findByTitle(type, title) {
-    for (const id of this.cache.listLocalIds()) {
+    const ids = new Set([...this.cache.listDiskIds(), ...this.cache.listLocalIds()]);
+    for (const id of ids) {
       if (this.deleted.has(id)) continue;
       const entry = this.cache.getEntry(id);
       if (entry !== null && sameTitle(entry, { type, title })) return entry;
@@ -538,6 +558,28 @@ class MemoryS3Service {
     } catch {
       return null; // 远端对象损坏 → 无从合并，调用方继续抛 CONFLICT。
     }
+  }
+
+  /** 远端预检：列出同 type 前缀（memories/<type>/），匹配 (type, title) 返回首个条目。 */
+  async #findRemoteByTitle(type, title) {
+    try {
+      let token;
+      do {
+        const page = await this.s3.listObjects({ prefix: `memories/${type}/`, continuationToken: token });
+        for (const item of page.keys) {
+          // item.key 形如 [<prefix>/]memories/<type>/<id>.json → 提取 id（兼容有无前导斜杠）。
+          const match = /(?:^|\/)memories\/[^/]+\/([^/]+)\.json$/.exec(item.key);
+          if (match === null) continue;
+          const remote = await this.#readRemoteByType(type, match[1]);
+          if (remote !== null && sameTitle(remote, { type, title })) return remote;
+        }
+        token = page.nextToken;
+      } while (token !== undefined);
+    } catch {
+      // 预检失败不阻塞创建（远端不可达时降级为正常创建路径）。
+      return null;
+    }
+    return null;
   }
 
   /** 写路径必须有 agent（审批路由与审计归属）：缺失即失败封闭。 */
@@ -1110,6 +1152,26 @@ export function apply(ctx, config = {}) {
     // dispose：S3 客户端无连接句柄；cache/audit 为文件追加式，无资源需显式关闭。骨架无操作。
   });
 
+  // 启动预热：插件加载后立即后台拉取一次远端记忆（fire-and-forget，不阻塞加载）。
+  // 理由（ARCHITECTURE.md D1）：快照注入是同步的（rc.6 不 await 提供者），只读本地缓存投影；
+  // 若不预热，新会话首启时缓存为空 → 快照无内容可注入。预热让跨会话记忆尽快进入缓存。
+  // 仅凭据已配置（configured）且缓存为空时触发，避免每次启动都全量拉取。
+  if (configured && cache.listDiskIds().length === 0) {
+    setTimeout(() => {
+      service
+        .sync()
+        .then((result) => {
+          if (!result.ok) {
+            console.warn(`[memory-s3] warm sync failed: ${result.error ?? 'unknown'}`);
+          }
+        })
+        .catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn(`[memory-s3] warm sync error: ${message}`);
+        });
+    }, 0);
+  }
+
   // 审批 answerer：只认领本插件写请求（toolName 前缀 + reason 带 [dsh-memory-s3]）。
   // auto → 直接放行；off → 直接拒绝；ask → 交下游（UI）answerer。prepend 保证确定性先于 UI。
   ctx.on(
@@ -1161,7 +1223,7 @@ export function apply(ctx, config = {}) {
     const record = event;
     if (record === null || typeof record !== 'object') return;
     if (record.type !== 'turn/end') return;
-    if (cache.listLocalIds().length > 0) return; // 已有缓存，不自动全量同步
+    if (cache.listDiskIds().length > 0) return; // 已有缓存，不自动全量同步
     void service
       .sync()
       .catch((error) => {

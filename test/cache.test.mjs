@@ -55,10 +55,11 @@ test('putEntry/getEntry：往返 + 命中提升 LRU 序', () => {
   assert.deepEqual(cache.listLocalIds(), ['a', 'b', 'c']);
   cache.getEntry('a'); // 命中提升 → a 变为最新
   assert.deepEqual(cache.listLocalIds(), ['b', 'c', 'a']);
-  cache.putEntry('d', { id: 'd' }); // 超上限逐出最旧（b）
+  cache.putEntry('d', { id: 'd' }); // 超上限逐出最旧（b）——只逐出热层
   assert.deepEqual(cache.listLocalIds(), ['c', 'a', 'd']);
   assert.equal(cache.hasLocal('b'), false);
-  assert.deepEqual(cache.getEntry('b'), null);
+  // 逐出的是内存热层；磁盘持久化层保留（跨进程回源是持久化语义，见「条目持久化」测试）。
+  assert.deepEqual(cache.getEntry('b'), { id: 'b' });
   assert.deepEqual(cache.getEntry('a'), { id: 'a' });
 });
 
@@ -114,4 +115,44 @@ test('磁盘写失败：降级内存-only，不抛错', () => {
 test('createCache：缺 dir 抛 INVALID_CONFIG', () => {
   assert.throws(() => createCache(), (err) => err.code === 'INVALID_CONFIG');
   assert.throws(() => createCache({ dir: '' }), (err) => err.code === 'INVALID_CONFIG');
+});
+
+test('条目持久化：同 dir 新实例可跨进程读回条目（磁盘回源）', () => {
+  const dir = tempDir(test);
+  const a = createCache({ dir });
+  const entry = { id: 'e1', type: 'preference', title: '语言', content: '用户使用中文交流', importance: 5, tags: ['偏好'] };
+  a.putEntry('e1', entry);
+  // 模拟新进程：新实例（内存热层为空）必须从磁盘读回。
+  const b = createCache({ dir });
+  assert.equal(b.listLocalIds().length, 0, '热层为空');
+  assert.deepEqual(b.listDiskIds(), ['e1']);
+  assert.deepEqual(b.getEntry('e1'), entry, '磁盘回源成功');
+  assert.equal(b.hasLocal('e1'), true, '回源后进入热层');
+});
+
+test('条目磁盘文件 0600 权限（POSIX）', () => {
+  const dir = tempDir(test);
+  const cache = createCache({ dir });
+  cache.putEntry('k', { id: 'k' });
+  const mode = statSync(join(dir, 'entries', 'k.json')).mode & 0o777;
+  assert.equal(mode, 0o600);
+});
+
+test('deleteEntry：内存 + 磁盘同时删除，幂等', () => {
+  const dir = tempDir(test);
+  const cache = createCache({ dir });
+  cache.putEntry('a', { id: 'a' });
+  cache.putEntry('b', { id: 'b' });
+  cache.deleteEntry('a');
+  assert.equal(cache.getEntry('a'), null);
+  assert.deepEqual(cache.listDiskIds(), ['b']);
+  assert.doesNotThrow(() => cache.deleteEntry('不存在'));
+  const fresh = createCache({ dir });
+  assert.deepEqual(fresh.listDiskIds(), ['b'], '删除已持久化');
+});
+
+test('listDiskIds：entries 目录不存在时返回空', () => {
+  const dir = tempDir(test);
+  const cache = createCache({ dir });
+  assert.deepEqual(cache.listDiskIds(), []);
 });

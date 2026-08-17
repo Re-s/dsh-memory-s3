@@ -214,10 +214,13 @@ test('memory_s3_save 写路径：审批 → If-None-Match PUT → 缓存 → sea
     assert.equal(result.ok, true);
     assert.equal(result.action, 'created');
     assert.equal(result.entry.type, 'preference');
-    assert.equal(records.length, 1, 'created 路径只发一次 PUT');
-    assert.equal(records[0].init.method, 'PUT');
-    assert.equal(records[0].init.headers['if-none-match'], '*');
-    assert.match(records[0].url, /\/mem\/dsh-memory-s3\/memories\/preference\/.+\.json$/);
+    // created 路径：远端预检（缓存空 → listObjects） + PUT 条件创建。
+    assert.equal(records.length, 2, 'created = 预检 list + PUT');
+    assert.equal(records[0].init.method, 'GET');
+    assert.match(records[0].url, /list-type=2/);
+    assert.equal(records[1].init.method, 'PUT');
+    assert.equal(records[1].init.headers['if-none-match'], '*');
+    assert.match(records[1].url, /\/mem\/dsh-memory-s3\/memories\/preference\/.+\.json$/);
 
     // 读路径：search 走缓存（无需 fetch）。
     const searchTool = tools.find((t) => t.name === 'memory_s3_search');
@@ -225,7 +228,7 @@ test('memory_s3_save 写路径：审批 → If-None-Match PUT → 缓存 → sea
     assert.equal(search.ok, true);
     assert.equal(search.total, 1);
     assert.equal(search.entries[0].title, '语言');
-    assert.equal(records.length, 1, 'search 不触发网络请求');
+    assert.equal(records.length, 2, 'search 不触发网络请求');
   } finally {
     restore();
     rmSync(dir, { recursive: true, force: true });
@@ -245,8 +248,8 @@ test('memory_s3_save 同 (type,title) → merged（update 审批，携带新旧�
     assert.equal(merged.ok, true);
     assert.equal(merged.action, 'merged');
     assert.equal(merged.entry.content, '用户用中文和英文交流');
-    // merged = head + PUT(If-Match)：共 2 次请求（前一条 created 的 PUT 不计入本轮断言）。
-    const lastTwo = records.slice(1);
+    // merged = head + PUT(If-Match)：最后 2 次请求（前一条 created 的 list+PUT 不计入本轮）。
+    const lastTwo = records.slice(-2);
     assert.equal(lastTwo.length, 2);
     assert.equal(lastTwo[0].init.method, 'HEAD');
     assert.equal(lastTwo[1].init.method, 'PUT');
@@ -269,7 +272,8 @@ test('审批拒绝 → DENIED + 零落盘 + *-denied 审计行', async () => {
     const result = await saveTool.execute({ type: 'preference', title: 'x', content: 'y' }, EXEC());
     assert.equal(result.ok, false);
     assert.equal(result.error.code, 'DENIED');
-    assert.equal(records.length, 0, '被拒写零落盘');
+    // 被拒写零落盘：只可能有缓存空时的预检 GET，绝无 PUT/HEAD 写请求。
+    assert.ok(records.every((r) => r.init.method !== 'PUT' && r.init.method !== 'HEAD'), '被拒写零落盘');
     const audit = readFileSync(join(dir, 'audit.jsonl'), 'utf8');
     assert.match(audit, /save-denied/);
   } finally {
@@ -362,6 +366,70 @@ test('memory_s3_sync 拉取远端条目并更新缓存索引（mock List+Get）'
     assert.equal(status.status.cachedEntries, 1);
     assert.equal(status.status.sync.ok, true);
     assert.ok(status.status.sync.lastSync);
+  } finally {
+    globalThis.fetch = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('save 远端预检去重：缓存空但 S3 已有同 (type,title) → merged 而非重复创建', async () => {
+  const dir = tempDir();
+  const records = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const record = { url: String(url), init: { ...init, headers: { ...init?.headers } } };
+    records.push(record);
+    if (init?.method === 'HEAD') {
+      return new Response(null, { status: 200, headers: { etag: '"e1"' } });
+    }
+    if (init?.method === 'PUT') {
+      return new Response('', { status: 200, headers: { etag: '"e2"' } });
+    }
+    // GET：listObjects 返回一个远端对象 memories/preference/old-id.json。
+    const u = new URL(String(url));
+    if (u.searchParams.get('list-type') === '2') {
+      return new Response(
+        '<ListBucketResult><IsTruncated>false</IsTruncated>' +
+          '<Contents><Key>memories/preference/old-id.json</Key><ETag>"e0"</ETag></Contents>' +
+          '</ListBucketResult>',
+        { status: 200 },
+      );
+    }
+    // GET：getObject 返回同 title 的远端条目。
+    return new Response(
+      JSON.stringify({
+        id: 'old-id',
+        type: 'preference',
+        title: '语言',
+        content: '旧内容',
+        importance: 3,
+        tags: [],
+        createdAt: 1,
+        updatedAt: 1,
+        recallCount: 0,
+        lastRecalled: null,
+        workspaceKey: '',
+        agentKey: '',
+      }),
+      { status: 200 },
+    );
+  };
+  try {
+    const { ctx, tools } = makeCtx();
+    apply(ctx, { bucket: 'mem', cacheDir: dir }); // 缓存空
+    const saveTool = tools.find((t) => t.name === 'memory_s3_save');
+    const result = await saveTool.execute(
+      { type: 'preference', title: '语言', content: '用户用中文交流', importance: 5 },
+      EXEC(),
+    );
+    assert.equal(result.ok, true);
+    assert.equal(result.action, 'merged', '远端已有同 title → 合并而非创建重复');
+    assert.equal(result.entry.content, '用户用中文交流');
+    assert.equal(result.entry.id, 'old-id', '沿用远端条目 id');
+    // 预检 list + getObject + HEAD + PUT(If-Match) 更新。
+    assert.equal(records.length, 4);
+    assert.equal(records[3].init.method, 'PUT');
+    assert.ok(records[3].init.headers['if-match']);
   } finally {
     globalThis.fetch = original;
     rmSync(dir, { recursive: true, force: true });

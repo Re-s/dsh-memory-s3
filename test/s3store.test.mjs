@@ -158,6 +158,18 @@ test('listObjects 无截断时不返回 nextToken', async () => {
   }
 });
 
+test('listObjects 对 404 容错为空列表（AWS/RustFS 行为差异兼容）', async () => {
+  const m = mockFetch(() => new Response('', { status: 404 }));
+  try {
+    const store = createS3Store(STORE_CONFIG);
+    const { keys, nextToken } = await store.listObjects({ prefix: 'memories/' });
+    assert.equal(keys.length, 0);
+    assert.equal(nextToken, undefined);
+  } finally {
+    m.restore();
+  }
+});
+
 test('getObject 对 5xx 指数退避重试后成功（最多 3 次重试）', async () => {
   let n = 0;
   const m = mockFetch(() => {
