@@ -1,0 +1,4 @@
+# dsh-memory-s3 bundle patch: mount the S3-backed memory plugin.
+- insert:
+    - id: memory-s3
+      name: dsh-memory-s3

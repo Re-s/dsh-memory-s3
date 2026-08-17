@@ -1,0 +1,201 @@
+// types.d.ts — dsh-memory-s3 类型契约（声明合并）。
+//
+// 本插件入口是纯 ESM JavaScript；类型契约集中在本文件：
+// - `declare module '@deepseek-ai/cordis'`：ctx.memoryS3 服务（Service Definition 面）
+//   与审批 seam 消费面。
+//
+// 设计继承自 dsh-memento 的类型契约风格（MIT/Apache 参考），
+// 差异：条目携带 embedding（向量检索），存储为 S3 对象而非本地 SQLite。
+
+export type MemoryS3Type = 'preference' | 'project' | 'decision' | 'history'
+
+export type MemoryS3WritePolicy = 'ask' | 'auto' | 'off'
+
+export type MemoryS3Action =
+  | 'save'
+  | 'update'
+  | 'remove'
+  | 'forget'
+  | 'recall'
+  | 'seed'
+  | 'sync'
+
+/** S3 同步状态。 */
+export interface MemoryS3SyncState {
+  /** 上次成功同步的 ISO 时间；从未同步为 null。 */
+  lastSync: string | null
+  /** 同步是否成功（失败时 stale 读取可用）。 */
+  ok: boolean
+  /** 失败原因（ok=false 时）。 */
+  error?: string
+}
+
+/** 落盘条目（S3 entries/<id>.json 的形状）。 */
+export interface MemoryS3Entry {
+  /** 条目 id（本插件生成，跨会话稳定）。 */
+  id: string
+  /** 类型：preference=用户画像 / project=项目知识 / decision=决策 / history=会话摘要。 */
+  type: MemoryS3Type
+  /** 简短标题（同类型去重键）。 */
+  title: string
+  /** 条目正文。 */
+  content: string
+  /** 标签数组。 */
+  tags: string[]
+  /** 重要性 1-5；>= threshold 进入自动注入候选。 */
+  importance: number
+  /** 来源标注（tool / auto-capture / seed 等）。 */
+  source: string
+  /** 创建时间（epoch ms）。 */
+  createdAt: number
+  /** 最近更新时间（epoch ms）。 */
+  updatedAt: number
+  /** 召回次数（排序用：高频即重要）。 */
+  recallCount: number
+  /** 最近召回时间；从未命中为 null。 */
+  lastRecalled: number | null
+  /** 嵌入向量（可插拔嵌入器可用时填充；无则向量检索降级为关键词）。 */
+  embedding?: number[]
+  /** workspace 条目的规范化 cwd 键；'' = 全局（跨工作区）。 */
+  workspaceKey: string
+  /** 规范化 agentPreset 键；'' = 共享层（所有 preset 可见）。 */
+  agentKey: string
+}
+
+/** 写入输入（save/seed 用）。 */
+export interface MemoryS3EntryInput {
+  type: MemoryS3Type
+  title: string
+  content: string
+  tags?: string[]
+  importance?: number
+  source?: string
+  /** 显式 workspaceKey；省略时取写方会话 cwd。 */
+  workspaceKey?: string
+  /** 显式 agentKey；省略时取写方会话 agentPreset。 */
+  agentKey?: string
+}
+
+/** 会话最小形状（插件只读这些面）。 */
+export interface MemoryS3SessionLike {
+  id?: unknown
+  header?: { cwd?: unknown; agentPreset?: unknown }
+}
+
+/** 审批服务最小形状（插件消费的 seam 面）。 */
+export interface MemoryS3ApprovalLike {
+  request(req: {
+    agent?: unknown
+    toolName?: string
+    reason?: string
+    callId?: unknown
+    signal?: AbortSignal
+  }): Promise<string>
+  overrideOf?(session: unknown): string | undefined
+}
+
+/** 写上下文：审批路由与审计归属所必需。agent 缺失时写失败封闭。 */
+export interface MemoryS3WriteContext {
+  /** 发起写的 agent（其 session 承载审批审计对）。 */
+  agent: { session?: MemoryS3SessionLike | null } | null | undefined
+  /** 发起写的工具 callId。 */
+  callId?: unknown
+  /** 取消信号：中止即 cancelled，不写任何东西。 */
+  signal?: AbortSignal
+}
+
+/** 检索过滤条件。 */
+export interface MemoryS3Filter {
+  type?: MemoryS3Type
+  tags?: string[]
+  importanceMin?: number
+  limit?: number
+}
+
+/** 语义召回请求。 */
+export interface MemoryS3RecallQuery {
+  query: string
+  type?: MemoryS3Type
+  tags?: string[]
+  /** 向量 top-k（默认 20）。 */
+  topK?: number
+}
+
+/** 检索结果。 */
+export interface MemoryS3QueryResult {
+  entries: MemoryS3Entry[]
+  total: number
+  /** 结果是否来自过期缓存（离线降级标记）。 */
+  stale: boolean
+}
+
+/** 同步结果。 */
+export interface MemoryS3SyncResult {
+  ok: boolean
+  pulled: number
+  pushed?: number
+  updatedAt: string
+  error?: string
+}
+
+/** 状态视图。 */
+export interface MemoryS3Status {
+  configured: boolean
+  sync: MemoryS3SyncState
+  cachedEntries: number
+  remoteEntries?: number
+  embedder: 'none' | 'openai-compatible' | 'ollama'
+  cacheDir: string
+}
+
+/** ctx.memoryS3 服务：写方法内部强制过审批门，读方法无审批。 */
+export interface MemoryS3Service {
+  /** 新增条目（审批门 + 去重合并）。 */
+  save(
+    input: MemoryS3EntryInput,
+    write: MemoryS3WriteContext,
+  ): Promise<{ action: 'created' | 'merged'; entry: MemoryS3Entry }>
+
+  /** 关键词检索（子串匹配 + 元数据过滤；无审批；走缓存）。 */
+  search(filter: MemoryS3Filter & { text?: string }): MemoryS3QueryResult
+
+  /** 语义召回（向量 top-k + 关键词混合；无审批；走缓存）。 */
+  recall(query: MemoryS3RecallQuery): Promise<MemoryS3QueryResult>
+
+  /** 列表（按 updatedAt 倒序，分页）。 */
+  list(filter: MemoryS3Filter & { offset?: number }): MemoryS3QueryResult
+
+  /** 更新条目（审批门；载荷携带新旧全文）。 */
+  update(
+    id: string,
+    patch: Partial<Pick<MemoryS3EntryInput, 'title' | 'content' | 'type' | 'tags' | 'importance'>>,
+    write: MemoryS3WriteContext,
+  ): Promise<{ previous: MemoryS3Entry; entry: MemoryS3Entry }>
+
+  /** 删除条目（审批门；载荷携带被删全文）。 */
+  remove(id: string, write: MemoryS3WriteContext): Promise<{ entry: MemoryS3Entry }>
+
+  /** 抑制自动注入而不删除（无审批；仅改本地标志，S3 侧保留）。 */
+  forget(id: string, forgotten: boolean): Promise<{ entry: MemoryS3Entry }>
+
+  /** 手动同步：拉取远端增量，重建索引。 */
+  sync(): Promise<MemoryS3SyncResult>
+
+  /** 状态视图。 */
+  status(): MemoryS3Status
+}
+
+declare module '@deepseek-ai/cordis' {
+  interface Context {
+    /** dsh-memory-s3 记忆服务（本插件提供）。 */
+    memoryS3: MemoryS3Service
+    /** 审批 seam（本插件消费；由 DSH interaction 能力提供）。 */
+    approval: MemoryS3ApprovalLike
+  }
+  interface Events {
+    /** 审批 waterfall（本插件 answerer 挂链）。 */
+    'approval/request'(req: unknown, next: () => Promise<string>): Promise<string>
+    /** 会话事件桥（自动同步触发等观察面用）。 */
+    'session/event'(session: unknown, event: unknown): void
+  }
+}
