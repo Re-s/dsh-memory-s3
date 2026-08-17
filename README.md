@@ -19,29 +19,31 @@
 ### 前置要求
 
 - Node.js ≥ 20（推荐 22+）
-- DeepSeek Harness（`dsh` CLI，rc.6+）
+- DeepSeek Harness（`dsh` CLI，rc.6+），两种获取方式：
+  - **全局安装**（推荐，一劳永逸）：`npm install -g @deepseek-ai/dsh`
+  - **免安装调用**（新机器/容器首选）：`npx @deepseek-ai/dsh`（与 `dsh` 完全等价，本文命令两种前缀可互换）
 - 一个 S3 兼容对象存储桶（AWS S3 / MinIO / R2 / OSS）
 
 ### 安装
 
-从 GitHub 获取（推荐，pnpm 语法，`dsh plugin add` 透传）：
+从 GitHub 获取（推荐，pnpm 语法，`dsh plugin add` 透传）。以下以 `npx @deepseek-ai/dsh` 为例（无需全局安装）；已全局安装 `dsh` 时，将 `npx @deepseek-ai/dsh` 替换为 `dsh` 即可：
 
 ```bash
 # 方式一：HTTPS 直接安装
-dsh plugin --profile web add https://github.com/Re-s/dsh-memory-s3.git
+npx @deepseek-ai/dsh plugin --profile web add https://github.com/Re-s/dsh-memory-s3.git
 
 # 方式二：指定分支（如 main）/ tag / commit
-dsh plugin --profile web add https://github.com/Re-s/dsh-memory-s3.git#main
+npx @deepseek-ai/dsh plugin --profile web add https://github.com/Re-s/dsh-memory-s3.git#main
 
 # 方式三：SSH 方式（需配置 GitHub SSH key）
-dsh plugin --profile web add git@github.com:Re-s/dsh-memory-s3.git
+npx @deepseek-ai/dsh plugin --profile web add git@github.com:Re-s/dsh-memory-s3.git
 ```
 
 本地开发（源码调试，link 方式）：
 
 ```bash
 git clone https://github.com/Re-s/dsh-memory-s3.git
-dsh plugin --profile web add "link:/path/to/dsh-memory-s3"
+npx @deepseek-ai/dsh plugin --profile web add "link:/path/to/dsh-memory-s3"
 ```
 
 配置环境变量（S3 凭据）：

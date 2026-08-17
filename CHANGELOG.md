@@ -9,7 +9,7 @@
 
 ### Changed
 
-- 安装方式：支持从 GitHub 获取（`dsh plugin add https://github.com/Re-s/dsh-memory-s3.git`），本地 `link:` 方式保留为开发选项（README §安装）
+- 安装方式：支持从 GitHub 获取（`dsh plugin add https://github.com/Re-s/dsh-memory-s3.git`）；命令前缀兼容全局 `dsh` 与免安装 `npx @deepseek-ai/dsh`，本地 `link:` 方式保留为开发选项（README §安装）
 
 ### 规划中（Initiation 完成）
 
