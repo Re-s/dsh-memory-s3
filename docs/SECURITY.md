@@ -56,31 +56,32 @@
 
 ## 4. 最小权限（IAM / 桶策略）
 
-### AWS IAM 策略（最小）
+### AWS IAM 策略（最小，实证自 S3 调研）
 
 ```json
 {
   "Version": "2012-10-17",
   "Statement": [
     {
+      "Sid": "AllowListBucketUnderPrefix",
       "Effect": "Allow",
-      "Action": [
-        "s3:GetObject",
-        "s3:PutObject",
-        "s3:DeleteObject",
-        "s3:ListBucket"
-      ],
-      "Resource": [
-        "arn:aws:s3:::my-memory-bucket",
-        "arn:aws:s3:::my-memory-bucket/dsh-memory-s3/*"
-      ],
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::my-memory-bucket",
       "Condition": {
-        "StringEquals": { "s3:prefix": ["dsh-memory-s3/"] }
+        "StringLike": { "s3:prefix": ["dsh-memory-s3/memories/*"] }
       }
+    },
+    {
+      "Sid": "AllowObjectOpsUnderPrefix",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:HeadObject"],
+      "Resource": "arn:aws:s3:::my-memory-bucket/dsh-memory-s3/memories/*"
     }
   ]
 }
 ```
+
+要点：**对象操作绑死 `Resource: <bucket>/<prefix>/memories/*`；ListBucket 用 `s3:prefix` 条件**（StringLike）。R2 用账号级 API Token（限制到具体 bucket）；MinIO 支持同语法 IAM policy，此 JSON 可直接复用。
 
 ### MinIO 等价（mc alias + policy）
 
@@ -101,7 +102,7 @@ mc admin policy attach local memory-s3-min --user memory-s3
 | 层 | 措施 |
 |---|---|
 | 传输 | 强制 HTTPS（endpoint 必须以 `https://` 开头；`http://` 仅允许显式配置且告警） |
-| 静态（S3） | SSE-S3 默认；Config `serverSideEncryption: 'AES256' \| 'aws:kms'` |
+| 静态（S3） | **各平台默认静态加密即达标**（AWS SSE-S3 自动 AES-256 / R2 自动 AES-256-GCM / OSS AES256），不引入 KMS；Config `serverSideEncryption` 可选透传 |
 | 静态（本地缓存） | 文件权限 0600（POSIX；win32 跳过，文档明示）；缓存内容与 S3 对象同明文（依赖 S3 侧加密） |
 
 ## 6. 审计与重建（S2 不变量）

@@ -78,11 +78,12 @@
 - 召回/快照：audit(recalled)/audit(snapshot) 行（snapshot 行与注入文本逐字一致）。
 - **rc.6 会话事件约束**：不 append 未注册的 memory/* 事件类型（`KNOWN_SESSION_EVENT_TYPES` 门），与 dsh-memento 同策略。
 
-### D6. S3 对象布局：每条目一对象 + manifest 清单（详见 §3）
-- 条目对象 `entries/<id>.json`：GET/PUT/DELETE 粒度最小、可版本化、删除即生效。
-- `manifest.json`：数据面元数据（schema_version/updated_at/entry_count/checksums），写路径读改写。
-- 乐观并发：PUT 带 `If-Match`（条目 ETag）；manifest 更新带 `If-Match`（防覆盖他人同步）。
-- 无 bucket 版本控制依赖（默认关闭，不假设提供商支持）。
+### D6. S3 对象布局：每记忆一对象 + 桶版本控制（详见 §3，实证自 S3 调研）
+- 条目对象 `memories/{kind}/{id}.json`：GET/PUT/DELETE 粒度最小、删除即生效、冲突面最小（不同 key 互不干扰）。
+- **不建 manifest 清单**：≤10k 规模无需全量遍历；日常检索按 id 直读 / 按 kind 前缀 ListObjectsV2 即可。
+- 乐观并发（S3 条件写 GA）：**创建**用 `If-None-Match: *`（已存在返回 412/409）；**更新**用 HeadObject 取 ETag + `If-Match: <etag>` PUT；412/409 → 重读-合并-指数退避重试（≤3 次）。
+- 桶版本控制：建议开启（防误覆盖低成本保险；单条 1-2KB 存储翻倍可忽略）。
+- 生命周期：仅对删除标记/旧版本设 Expiration 清理；**不转冷存储**（Glacier 等 40KB/对象固定开销对 1-2KB 记忆对象转冷反而亏钱）。
 
 ### D7. 凭据与网络面（明确披露，与 dsh-memento「零网络零凭据」哲学分岔）
 - S3 凭据：环境变量 `AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY/SESSION_TOKEN` 优先，其次 DSH 配置（骨架阶段仅环境变量；`dsh-credentials` 接入列为后续）。
@@ -94,37 +95,45 @@
 - 可重试错误（网络抖动/5xx）指数退避最多 3 次；仍失败 → 写标记 pending（骨架阶段仅日志），读走缓存降级并标注 stale。
 - 加载期校验：bucket/prefix/endpoint 非法配置响亮失败（schemastery schema 层双保险）。
 
-## 3. S3 对象布局
+## 3. S3 对象布局（实证自 S3 调研子代理）
 
 ```
 s3://<bucket>/<prefix>/
-├── manifest.json            # {schema_version, updated_at, entry_count, checksum, last_sync}
-├── entries/
-│   └── <entry-id>.json      # 条目全文（含 embedding 数组），内容寻址可版本化
-└── archive/                 # 会话摘要归档（P2）
-    └── sessions/
-        └── <session-id>.jsonl
+└── memories/
+    ├── {kind}/
+    │   └── <entry-id>.json      # 条目全文（含 embedding 数组）；kind = preference|project|decision|history
+    └── _meta/
+        └── index.json           # 可选清单（仅"全量遍历"场景才建；骨架阶段不建）
 ```
 
-**manifest.json 形状**：
+**条目对象形状**（= `MemoryS3Entry` 的 JSON 序列化，见 types.d.ts）：
 ```json
 {
-  "schema_version": 1,
-  "updated_at": "2026-08-17T12:00:00.000Z",
-  "entry_count": 3,
-  "checksum": "sha256:...",
-  "entries": [
-    { "id": "uuid", "key": "entries/uuid.json", "etag": "\"abc123\"", "updated_at": "..." }
-  ]
+  "id": "uuid",
+  "type": "preference",
+  "title": "语言",
+  "content": "用户用中文交流",
+  "tags": ["偏好"],
+  "importance": 5,
+  "source": "tool",
+  "createdAt": 1789000000000,
+  "updatedAt": 1789000000000,
+  "recallCount": 0,
+  "lastRecalled": null,
+  "embedding": [0.0023, -0.011],
+  "workspaceKey": "",
+  "agentKey": ""
 }
 ```
 
-**并发写协议**：
-1. 读 manifest（GetObject，取 ETag）
-2. 写条目对象（PutObject with If-Match 条目旧 ETag 或 If-None-Match 创建）
-3. 更新 manifest（PutObject with If-Match manifest ETag）；失败 → 重读合并（last-writer-wins 按 updated_at）
+**并发写协议**（条件写，无锁数据库语义）：
+1. **创建**：PutObject with `If-None-Match: *`；412/409（已存在）→ 读回合并或重试
+2. **更新**：HeadObject 取 ETag → PutObject with `If-Match: <etag>`；412（被并发修改）→ 重读-合并-指数退避（≤3 次）
+3. **删除**：DeleteObject（versioning 下产生删除标记，可恢复）
 
-**对象生命周期**：条目删除 = DeleteObject（manifest 同步移除）；桶级 Lifecycle 规则仅用于 archive/ 冷归档（P2）。
+**一致性**：AWS/R2/OSS 均强读后写（无需读重试补偿）；自建 MinIO 需 xfs/zfs（ext4/NFS 不保证）——文档明示。
+
+**对象生命周期**：桶 versioning 开启；Lifecycle 仅 Expiration 清理删除标记/旧版本；不转冷存储。
 
 ## 4. 模块划分与依赖方向
 
@@ -180,12 +189,20 @@ memory_s3_sync 工具 / 启动预热 / 会话事件驱动
 | 治理 | 审批门不可绕过；审计三链可重建；卸载不删云上数据（文档明示） |
 | 信任域 | 单 bucket+prefix 单信任域；共享 = 共享数据（README 安全边界明示） |
 
-## 7. 待调研确认的选型（TECH_STACK.md 落定）
+## 7. 选型终审（已落定，详见 TECH_STACK.md）
 
-1. S3 客户端：官方 `@aws-sdk/client-s3` vs 零依赖自实现 SigV4（fetch+crypto）——**依赖子代理 B 报告**
-2. 向量检索：纯内存暴力余弦 vs 轻量索引库——**依赖子代理 C 报告**
-3. 嵌入器：OpenAI 兼容端点 vs Ollama 本地 vs DSH provider 复用——**依赖子代理 C 报告**
-4. DSH API 精确签名（tools.register/approval.request/systemPrompt.section）——**依赖子代理 A 报告**
+| 项 | 结论 | 依据 |
+|---|---|---|
+| S3 客户端 | **自实现最小 SigV4**（node:crypto + fetch，零依赖）；备选 minio@8.0.7；不采用 @aws-sdk/client-s3 | B 报告：19MB/26 包 vs 零依赖；5 类请求面窄可控 |
+| 向量检索 | 零依赖纯内存暴力扫描（Float32Array + 预归一化）；升级路径 sqlite-vec | C 报告：10k×768 ≈ 10-40ms、30MB |
+| 嵌入器 | 可插拔；默认 OpenAI 兼容端点（text-embedding-3-small，dimensions=768）；本地 Ollama /api/embed | C 报告：dsh-llm 无 embedding（实证） |
+| DSH API | tools.register / approval.request / systemPrompt.section / session/event（见 §2） | A 报告 + dsh-memento 实证 |
+
+## 8. 待补查项（实现阶段处理）
+
+- approval/asked + approval/decided 事件载荷结构（dsh-user-approval 未读）——审计链实现时对照
+- dshWorkshop.permissions 出站网络枚举的合法写法（骨架阶段声明 `network:https`，文档标注待核）
+- MinIO 条件 PUT（If-Match/If-None-Match）实测——冒烟测试时验证
 
 ---
 

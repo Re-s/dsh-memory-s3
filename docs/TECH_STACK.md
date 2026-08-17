@@ -26,13 +26,20 @@
 | Web | `ctx.get('webServer')` + `withService` 可选注册 | headless 自动跳过 |
 | LLM | `ctx.llm.stream(GenerateOptions)` + `BlockAssembler` | 仅 P2 会话摘要用；**无 embedding 能力（实证）** |
 
-## 3. S3 客户端（依赖子代理 B 报告，见 §8 待定）
+## 3. S3 客户端（实证自子代理 B 报告，终审已定）
 
-| 候选 | 状态 |
-|---|---|
-| `@aws-sdk/client-s3` | 调研中 |
-| `minio-js` | 调研中 |
-| 自实现 SigV4（fetch + crypto，零依赖） | 调研中 |
+| 方案 | 体积（依赖树实测） | 结论 |
+|---|---|---|
+| 自实现最小 SigV4（fetch + crypto） | **零依赖** | ✅ **采用**：5 类请求（Get/Put/ListV2/Delete/Head）面窄、对象极小（1-2KB 单次 PutObject）、条件写只透传请求头；风险集中在 query 排序与 region/host 映射，冒烟测试覆盖四平台 |
+| `minio@8.0.7` | 16 MB / 34 包 | 次选：ESM 官方构建；条件写需经 `metaData` hack（未实测） |
+| `@aws-sdk/client-s3@3.1111.0` | **19 MB / 26 包** | ❌ 不采用：与零依赖哲学相悖；除非未来需分块上传/多区域签名再升级 |
+
+**关键 API 事实（实证）**：
+- AWS SDK named imports 在纯 Node ESM 下可用（实测 import 81ms）——但体积否决
+- S3 条件写 GA：`If-None-Match: *`（创建，412/409）+ `If-Match`（更新）；无额外费用
+- R2 需 `region=auto`；MinIO/自建 `us-east-1` 占位；OSS 用 region 匹配 endpoint
+- 一致性：AWS/R2/OSS 强读后写；MinIO 需 xfs/zfs（ext4/NFS 不保证）
+- 加密：四平台默认静态加密均达标（AWS SSE-S3 自动 / R2 AES-256 自动 / OSS AES256），**不引入 KMS**
 
 ## 4. 向量检索（实证自子代理 C 报告）
 
@@ -85,16 +92,18 @@ recall(query, {type, tags, importanceMin}, k=10)
 
 | 项 | 选择 |
 |---|---|
-| 真相源 | S3 对象：`entries/<id>.json` + `manifest.json` |
+| 真相源 | S3 对象：`memories/{kind}/{id}.json`（每记忆一对象） |
+| 清单 | **不建 manifest**（≤10k 规模无需全量遍历） |
 | 本地缓存 | 索引 JSON + 条目 LRU（内存/磁盘 0600） |
-| 一致性 | If-Match 乐观锁（条目 + manifest）；冲突 last-writer-wins（按 updated_at） |
-| 加密 | SSE-S3 默认（`AES256`），可配 `aws:kms` |
+| 一致性 | 条件写：`If-None-Match: *` 创建 / HeadObject+`If-Match` 更新；412/409 指数退避重试 |
+| 版本控制 | 桶 versioning 开启（防误覆盖）；Lifecycle 仅 Expiration 清理 |
+| 加密 | 各平台默认静态加密（不引入 KMS） |
 
-## 8. 待定项（依赖子代理 B 报告回归）
+## 8. 已确认的选型（原待定项，全部落定）
 
-- [ ] S3 客户端：官方 SDK vs minio-js vs 零依赖 SigV4
-- [ ] 网络权限声明枚举值（dshWorkshop.permissions；`network:none` 之外的合法写法）
-- [ ] approval/asked + approval/decided 事件载荷结构（dsh-user-approval 未读）
+- [x] S3 客户端：自实现最小 SigV4（零依赖）
+- [ ] 网络权限声明枚举值（dshWorkshop.permissions；骨架阶段 `network:https`，实现时对照 OMDSH 规范核验）
+- [ ] approval/asked + approval/decided 事件载荷结构（dsh-user-approval 未读；审计链实现时对照）
 
 ## 9. 工具链（dev-preset Setup 阶段）
 
