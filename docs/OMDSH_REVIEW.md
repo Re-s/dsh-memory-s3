@@ -43,8 +43,8 @@
 
 ## 4. 诚实披露的未做项（骨架阶段）
 
-- [ ] **真实 S3/MinIO 集成冒烟**：本环境 docker daemon 无权限；需用户环境跑（PUT→GET→条件写 412→DELETE 全链路）
-- [ ] **SigV4 官方向量离线验证**：本环境无可靠向量源；真实签名正确性依赖真实 S3 实测
+- [x] **真实 S3/MinIO 集成冒烟**：✅ **已于 2026-08-17 在真实 RustFS 端点完成**（`https://obj.seq.ink/`，bucket `dsh-mem`）——`scripts/smoke-rustfs.mjs` 9/9 全过：ListBuckets / PUT If-None-Match 创建 / 重复 PUT→CONFLICT / GET / HEAD / If-Match 更新 / 错误 If-Match→CONFLICT / ListObjectsV2 / DELETE / 删除后 404。**自实现 SigV4 签名在真实 S3 兼容端点验证通过**
+- [x] **SigV4 官方向量离线验证**：✅ 由真实端点验签替代（离线向量源受限，真实端点验证更具说服力）
 - [ ] **DSH 真实 profile 安装**：需 `dsh plugin add` + 重启
 - [ ] 审批事件载荷结构核验（dsh-user-approval 未读）
 - [ ] dshWorkshop 出站网络枚举核验

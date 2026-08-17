@@ -25,3 +25,4 @@
 - 插件入口：`index.mjs`（MemoryS3Service + 9 工具 + 同步快照注入 + 审批 answerer + session/event 桥）
 - 类型契约：`types.d.ts`（ctx.memoryS3 声明合并）
 - 测试：8 个文件 105 例全绿（覆盖率行 96.07% / 分支 87.80% / 函数 95.50%）
+- **真实端点验签**：`scripts/smoke-rustfs.mjs`——2026-08-17 在 RustFS（https://obj.seq.ink/，bucket dsh-mem）9/9 全过，SigV4 签名与条件写在真实 S3 兼容端点验证通过
