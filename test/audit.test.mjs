@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -84,4 +84,35 @@ test('retentionDays 非 0：骨架阶段不删文件（语义占位）', () => {
   const audit = createAudit({ dir, retentionDays: 7 });
   audit.append('save', {});
   assert.equal(audit.readTail(1).length, 1); // 文件仍在，可读
+});
+
+test('createAudit：缺 dir 抛 INVALID_CONFIG', () => {
+  assert.throws(() => createAudit(), (err) => err.code === 'INVALID_CONFIG');
+  assert.throws(() => createAudit({ dir: '' }), (err) => err.code === 'INVALID_CONFIG');
+});
+
+test('append 写失败：抛结构化 AUDIT_FAILED，不静默吞错', () => {
+  // dir 指向一个已存在文件 → mkdirSync 失败 → append 必须响亮失败。
+  const dir = tempDir(test);
+  const blocker = join(dir, 'not-a-dir');
+  writeFileSync(blocker, 'occupied');
+  const audit = createAudit({ dir: blocker });
+  assert.throws(() => audit.append('save', {}), (err) => err.code === 'AUDIT_FAILED');
+});
+
+test('readTail：损坏行跳过，不阻塞整链读取', () => {
+  const dir = tempDir(test);
+  const good = JSON.stringify({ seq: 1, ts: '2026-08-17T12:00:00.000Z', action: 'save', data: { id: 'a' } });
+  writeFileSync(join(dir, 'audit.jsonl'), `${good}\n{corrupted line\n${good}\n`, { mode: 0o600 });
+  const audit = createAudit({ dir });
+  const records = audit.readTail(10);
+  assert.equal(records.length, 2); // 有效行都在，损坏行被跳过
+  assert.equal(records[1].seq, 1); // 有效行 seq 仍解析正确
+});
+
+test('审计文件被目录占据：启动降级 warn，readTail 抛 AUDIT_READ_FAILED', () => {
+  const dir = tempDir(test);
+  mkdirSync(join(dir, 'audit.jsonl')); // 目录占据日志文件路径
+  const audit = createAudit({ dir }); // 不抛（启动 seq 恢复降级）
+  assert.throws(() => audit.readTail(5), (err) => err.code === 'AUDIT_READ_FAILED');
 });

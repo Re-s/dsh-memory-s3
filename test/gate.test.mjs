@@ -45,12 +45,14 @@ test('摘要截断：>300 字符截断并标注 [truncated]，正文载荷保持
   assert.equal(parsed.payload.content, longContent);
 });
 
-test('摘要边界：恰好 300 字符不截断，301 截断', () => {
-  const atLimit = buildWriteReason({ action: 'save', payload: { text: 'y'.repeat(300) } });
+test('摘要边界：序列化文本恰好 ≤300 不截断，>300 截断', () => {
+  // 紧凑 JSON 开销为 8 字符（{"a":"..."}），故 280 字符 → 288 不截断，
+  // 295 字符 → 303 截断：精确落在 300 阈值两侧。
+  const atLimit = buildWriteReason({ action: 'save', payload: { a: 'y'.repeat(280) } });
   assert.ok(!atLimit.split('\n')[0].includes('[truncated]'));
-  const over = buildWriteReason({ action: 'save', payload: { text: 'y'.repeat(301) } });
+  const over = buildWriteReason({ action: 'save', payload: { a: 'y'.repeat(295) } });
   assert.ok(over.split('\n')[0].includes('[truncated]'));
-  assert.ok(parseWriteReason(over).payload.text.length === 301); // 正文无损
+  assert.ok(parseWriteReason(over).payload.a.length === 295); // 正文无损
 });
 
 test('isOwnReason：仅识别本插件 prefix', () => {
