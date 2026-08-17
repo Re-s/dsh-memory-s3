@@ -649,8 +649,8 @@ const OK_ERROR_PROPS = {
 const QUERY_RESULT_PROPS = {
   ...OK_ERROR_PROPS,
   entries: ENTRY_LIST_OUTPUT,
-  total: { type: 'integer', required: true },
-  stale: { type: 'boolean', required: true },
+  total: { type: 'integer' },
+  stale: { type: 'boolean' },
 };
 
 /** 工具 execute 的公共错误闸：领域错误 → {ok:false, error}；基础设施错误原样抛出。 */
@@ -702,7 +702,7 @@ function makeMemoryTools(service) {
           additionalProperties: false,
           properties: {
             ...OK_ERROR_PROPS,
-            action: { type: 'string', enum: ['created', 'merged'], required: true },
+            action: { type: 'string', enum: ['created', 'merged'] },
             entry: ENTRY_OUTPUT,
           },
         },
@@ -963,7 +963,6 @@ function makeMemoryTools(service) {
                 updatedAt: { type: 'string', required: true },
                 error: { type: 'string' },
               },
-              required: true,
             },
           },
         },
@@ -1014,7 +1013,6 @@ function makeMemoryTools(service) {
                 embedder: { type: 'string', required: true },
                 cacheDir: { type: 'string', required: true },
               },
-              required: true,
             },
           },
         },
