@@ -7,12 +7,14 @@
 ## ✨ 特性
 
 - **S3 兼容存储后端**：条目 CRUD + manifest 清单 + 乐观并发（If-Match）；自定义 endpoint 兼容 MinIO/R2/OSS
-- **结构化记忆模型**：`preference | project | decision | history` 四类条目，带 importance/tags/source/时间戳
+- **结构化记忆模型 v2.1**：`preference | project | decision | history | moment` 五类条目（moment = 时刻/照片/纪念日，对应 Tulving 情景记忆），带 importance/tags/source/时间戳 + 可选四维字段：`subject`（主体）/ `timeline`（时间线归属）/ `links`（关联引用）/ `locked`（锁定保护）
 - **向量语义检索**：可插拔嵌入器 + 余弦 top-k + 元数据/关键词混合召回（中文友好）
 - **本地缓存投影**：冻结快照只读本地缓存（rc.6 同步注入约束），S3 异步回源，离线降级只读
 - **写入审批门**：所有写操作强制 DSH approval seam（ask/auto/off），模型不可见不可改
 - **审计三链**：审批对 + 审计账本 + 快照，可从会话日志重建全部写入
 - **照片/文件附件**：条目可挂照片/文件——二进制存 S3 `files/{id}` 不可变对象（uuid 键 + If-None-Match 创建 + sha256 完整性），条目 JSON 只存附件元数据数组；本地文件经扩展名白名单 + 魔法字节嗅探 + 大小上限（20MB）三重校验；`memory_s3_attach` / `memory_s3_get_file` / `memory_s3_detach` 三工具
+- **反链索引（v2.1）**：写入 `links`（引用即链接，Obsidian/Zettelkasten 心智）自动回填本地反链索引（`lib/backlinks.mjs` → `backlinks.json`，0600 持久化，替换语义）；`memory_s3_backlinks` 查询「谁引用了该条目」（读路径无审批）；被引用数（图中心性）是快照注入的排序信号
+- **分层快照注入（v2.1）**：冻结快照按 Bonds（locked / 高重要性约定，保底 40% 预算）→ Moments（moment 按新近）→ Facts（按 importance，同分按被引用数）三层投影；带 links 的条目行尾自动标记 `→关联N`；`locked` 条目跳过同 title 自动合并（防无意覆盖）
 - **会话摘要归档**（规划）：会话结束自动提炼 → 待审提案
 
 ## 🚀 快速开始
@@ -90,7 +92,8 @@ memory_s3_save     保存一条记忆（过审批门；可携附件 attachments:
 memory_s3_search   关键词检索
 memory_s3_recall   语义召回
 memory_s3_list     列表/过滤
-memory_s3_update   更新（过审批门）
+memory_s3_backlinks 查询反链（谁引用了该条目；无审批，读本地索引）
+memory_s3_update   更新（过审批门；支持 subject/timeline/links/locked）
 memory_s3_delete   删除（过审批门）
 memory_s3_forget   抑制自动注入而不删除
 memory_s3_attach   给已有条目挂附件（过审批门）
@@ -114,7 +117,8 @@ dsh-memory-s3/
 │   ├── cache.mjs      # 本地缓存（索引 + 条目 LRU）
 │   ├── embedder.mjs   # 可插拔嵌入器（OpenAI 兼容 / Ollama）
 │   ├── vector.mjs     # 余弦 top-k + 过滤（纯 JS）
-│   ├── entry.mjs      # 条目模型校验/序列化（含附件元数据）
+│   ├── entry.mjs      # 条目模型校验/序列化（含附件元数据 + subject/timeline/links/locked）
+│   ├── backlinks.mjs  # 反链索引（links 入边镜像，本地 backlinks.json 持久化）
 │   ├── filemeta.mjs   # 附件探测：魔法字节 / 扩展名白名单 / 大小上限 / sha256
 │   ├── gate.mjs       # 审批门策略封装
 │   ├── audit.mjs      # 审计账本（JSONL）

@@ -1,6 +1,6 @@
 // test/index.test.mjs — 插件入口集成测试（mock ctx + mock fetch，不真实连网）。
 //
-// 覆盖：enabled:false 整体消失、十二工具与服务注册、systemPrompt 同步快照提供者
+// 覆盖：enabled:false 整体消失、十三工具与服务注册、systemPrompt 同步快照提供者
 // （WeakMap 冻结）、approval answerer 三态裁决（auto/off/ask）、save 写路径
 // （审批 → If-None-Match PUT）、审批拒绝 → DENIED + *-denied 审计行、读路径缓存、
 // 工具领域错误 → {ok:false, error}；附件能力（save/attach/detach/get_file 全链路、
@@ -15,10 +15,12 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { apply, Config } from '../index.mjs';
 import { strings } from '../lib/strings.mjs';
+import { parseWriteReason } from '../lib/gate.mjs';
 
 const TOOL_NAMES = [
   'memory_s3_save',
   'memory_s3_search',
+  'memory_s3_backlinks',
   'memory_s3_recall',
   'memory_s3_list',
   'memory_s3_update',
@@ -1035,13 +1037,14 @@ test('全部工具 render 回调可执行（success 与 error 两态），输出
   try {
     const { ctx, tools } = makeCtx();
     apply(ctx, { bucket: 'mem', cacheDir: dir });
-    assert.equal(tools.length, TOOL_NAMES.length, '工具总数 = 12');
+    assert.equal(tools.length, TOOL_NAMES.length, '工具总数 = 13');
     const entry = sampleEntry();
     const attachment = sampleAttachment();
     const error = { code: 'DENIED', message: 'denied by gate' };
     const cases = [
       ['memory_s3_save', { ok: true, action: 'created', entry }, { ok: false, error }],
       ['memory_s3_search', { ok: true, entries: [entry], total: 1, stale: false }, { ok: false, error }],
+      ['memory_s3_backlinks', { ok: true, entries: [entry], total: 1, stale: false }, { ok: false, error }],
       ['memory_s3_recall', { ok: true, entries: [entry], total: 1, stale: true }, { ok: false, error }],
       ['memory_s3_list', { ok: true, entries: [entry], total: 1, stale: false }, { ok: false, error }],
       ['memory_s3_update', { ok: true, previous: entry, entry }, { ok: false, error }],
@@ -1647,6 +1650,354 @@ test('基础设施错误（网络故障）→ 工具 execute 原样抛出（不�
       saveTool.execute({ type: 'preference', title: 't', content: 'c' }, EXEC()),
       (err) => err.code === 'S3_UNAVAILABLE',
     );
+  } finally {
+    restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── v2.1 记忆模型：四字段写入 / locked 跳过合并 / 反链工具 / 快照分层 ──
+
+test('save 携带 subject/timeline/links/locked → 条目落盘 + 审批 reason 载荷含新字段', async () => {
+  const dir = tempDir();
+  const records = [];
+  const restore = installFetchMock(records);
+  try {
+    const { ctx, tools, approvalCalls } = makeCtx();
+    apply(ctx, { bucket: 'mem', cacheDir: dir });
+    const saveTool = findTool(tools, 'memory_s3_save');
+    const result = await saveTool.execute(
+      {
+        type: 'moment',
+        title: '漂流瓶',
+        content: '投进海里',
+        subject: 'us',
+        timeline: 'α-2',
+        links: ['ghost-link'],
+        locked: true,
+      },
+      EXEC(),
+    );
+    assert.equal(result.ok, true);
+    assert.equal(result.action, 'created');
+    assert.equal(result.entry.type, 'moment');
+    assert.equal(result.entry.subject, 'us');
+    assert.equal(result.entry.timeline, 'α-2');
+    assert.deepEqual(result.entry.links, ['ghost-link']);
+    assert.equal(result.entry.locked, true);
+    // PUT 条目 body JSON 含四字段。
+    const put = records.find((r) => r.init.method === 'PUT' && /\/memories\//.test(r.url));
+    assert.ok(put, 'created 路径含条目 PUT');
+    const stored = JSON.parse(put.init.body);
+    assert.equal(stored.subject, 'us');
+    assert.equal(stored.timeline, 'α-2');
+    assert.deepEqual(stored.links, ['ghost-link']);
+    assert.equal(stored.locked, true);
+    // 审批 reason 载荷含新字段（approve-what-you-see）。
+    const { payload } = parseWriteReason(approvalCalls[0].reason);
+    assert.equal(payload.subject, 'us');
+    assert.equal(payload.timeline, 'α-2');
+    assert.deepEqual(payload.links, ['ghost-link']);
+    assert.equal(payload.locked, true);
+  } finally {
+    restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('update 修改 subject/timeline/links/locked：生效落盘；links 替换语义驱动反链', async () => {
+  const dir = tempDir();
+  const records = [];
+  const restore = installFetchMock(records);
+  try {
+    const { ctx, tools, approvalCalls } = makeCtx();
+    apply(ctx, { bucket: 'mem', cacheDir: dir });
+    const saveTool = findTool(tools, 'memory_s3_save');
+    const a = await saveTool.execute({ type: 'project', title: '世界线观测', content: 'c1' }, EXEC());
+    const b = await saveTool.execute({ type: 'project', title: '参考条目', content: 'cB' }, EXEC());
+    const updateTool = findTool(tools, 'memory_s3_update');
+    const up = await updateTool.execute(
+      { id: a.entry.id, subject: 'risu', timeline: 'β', links: [b.entry.id], locked: true, content: 'c2' },
+      EXEC(),
+    );
+    assert.equal(up.ok, true);
+    assert.equal(up.entry.subject, 'risu');
+    assert.equal(up.entry.timeline, 'β');
+    assert.deepEqual(up.entry.links, [b.entry.id]);
+    assert.equal(up.entry.locked, true);
+    // PUT body 含新字段；审批 reason 的 next 载荷含新字段。
+    const updatePut = records.at(-1);
+    assert.equal(updatePut.init.method, 'PUT');
+    const stored = JSON.parse(updatePut.init.body);
+    assert.equal(stored.subject, 'risu');
+    assert.equal(stored.timeline, 'β');
+    assert.deepEqual(stored.links, [b.entry.id]);
+    assert.equal(stored.locked, true);
+    const { payload: upPayload } = parseWriteReason(approvalCalls.at(-1).reason);
+    assert.equal(upPayload.next.subject, 'risu');
+    assert.equal(upPayload.next.timeline, 'β');
+    assert.deepEqual(upPayload.next.links, [b.entry.id]);
+    assert.equal(upPayload.next.locked, true);
+    // 反链：A 引用 B → backlinks(B) 返回 A。
+    const backlinksTool = findTool(tools, 'memory_s3_backlinks');
+    const bl = await backlinksTool.execute({ id: b.entry.id }, EXEC());
+    assert.equal(bl.ok, true);
+    assert.equal(bl.total, 1);
+    assert.equal(bl.entries[0].id, a.entry.id);
+    // links 替换为 []：旧出链反链消失。
+    const up2 = await updateTool.execute({ id: a.entry.id, links: [], subject: '', timeline: '' }, EXEC());
+    assert.equal(up2.ok, true);
+    assert.deepEqual(up2.entry.links, []);
+    const bl2 = await backlinksTool.execute({ id: b.entry.id }, EXEC());
+    assert.equal(bl2.total, 0, 'links 替换后旧反链消失');
+    // 空串清空语义（修复后）：缓存态 subject/timeline 为 undefined（缺省不落盘契约），
+    // 磁盘 JSON 不含空串脏键；读回 fromJSON 同样 undefined。
+    assert.equal(up2.entry.subject, undefined, '空串清除 subject → 缺省不落盘');
+    assert.equal(up2.entry.timeline, undefined, '空串清除 timeline → 缺省不落盘');
+    const clearPut = records.at(-1);
+    assert.ok(!('links' in JSON.parse(clearPut.init.body)), '空 links 数组不落盘');
+  } finally {
+    restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('locked 条目跳过同 title 自动合并：本地查重不触碰（created 而非 merged）', async () => {
+  const dir = tempDir();
+  const records = [];
+  const restore = installFetchMock(records);
+  try {
+    const { ctx, tools } = makeCtx();
+    apply(ctx, { bucket: 'mem', cacheDir: dir });
+    const saveTool = findTool(tools, 'memory_s3_save');
+    const first = await saveTool.execute({ type: 'preference', title: '暗号之约', content: 'v1', locked: true }, EXEC());
+    assert.equal(first.ok, true);
+    assert.equal(first.action, 'created');
+    assert.equal(first.entry.locked, true);
+    // 同 (type,title) 再存：locked 原条目不可触碰 → 新建而非合并。
+    const second = await saveTool.execute({ type: 'preference', title: '暗号之约', content: 'v2' }, EXEC());
+    assert.equal(second.ok, true);
+    assert.equal(second.action, 'created', 'locked 条目被跳过 → 新建');
+    assert.notEqual(second.entry.id, first.entry.id, '新条目独立 id');
+    assert.equal(second.entry.locked, false);
+    assert.equal(second.entry.content, 'v2');
+    // 原条目未被覆盖，两者并存。
+    const searchTool = findTool(tools, 'memory_s3_search');
+    const search = await searchTool.execute({ text: '暗号之约' }, EXEC());
+    assert.equal(search.total, 2, 'locked 原条目与新建条目并存');
+    assert.equal(first.entry.content, 'v1', '原锁定条目内容不变');
+  } finally {
+    restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('locked 条目跳过同 title 自动合并：远端预检同样不触碰', async () => {
+  const dir = tempDir();
+  const records = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const record = { url: String(url), init: { ...init, headers: { ...init?.headers } } };
+    records.push(record);
+    if (init?.method === 'PUT') return new Response('', { status: 200, headers: { etag: '"e2"' } });
+    const u = new URL(String(url));
+    if (u.searchParams.get('list-type') === '2') {
+      return new Response(
+        '<ListBucketResult><IsTruncated>false</IsTruncated>' +
+          '<Contents><Key>memories/preference/locked-id.json</Key><ETag>"e0"</ETag></Contents>' +
+          '</ListBucketResult>',
+        { status: 200 },
+      );
+    }
+    // getObject：远端同 title 但 locked=true 的条目。
+    return new Response(
+      JSON.stringify({
+        id: 'locked-id',
+        type: 'preference',
+        title: '暗号之约',
+        content: '只属于主人的暗号',
+        importance: 5,
+        tags: [],
+        source: 'tool',
+        createdAt: 1,
+        updatedAt: 1,
+        recallCount: 0,
+        lastRecalled: null,
+        workspaceKey: '',
+        agentKey: '',
+        locked: true,
+      }),
+      { status: 200 },
+    );
+  };
+  try {
+    const { ctx, tools } = makeCtx();
+    apply(ctx, { bucket: 'mem', cacheDir: dir }); // 缓存空 → 触发远端预检
+    const saveTool = findTool(tools, 'memory_s3_save');
+    const result = await saveTool.execute({ type: 'preference', title: '暗号之约', content: '新内容' }, EXEC());
+    assert.equal(result.ok, true);
+    assert.equal(result.action, 'created', '远端 locked 条目不参与合并 → 新建');
+    assert.notEqual(result.entry.id, 'locked-id');
+    // 预检 list + getObject + 创建 PUT：3 次请求。
+    assert.equal(records.length, 3);
+    assert.equal(records[0].init.method, 'GET');
+    assert.equal(records[1].init.method, 'GET');
+    assert.equal(records[2].init.method, 'PUT');
+    assert.equal(records[2].init.headers['if-none-match'], '*', '新建走条件创建');
+  } finally {
+    globalThis.fetch = original;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('memory_s3_backlinks：写正向 links 自动回填；来源删除后反链消失', async () => {
+  const dir = tempDir();
+  const records = [];
+  const restore = installFetchMock(records);
+  try {
+    const { ctx, tools, provided } = makeCtx();
+    apply(ctx, { bucket: 'mem', cacheDir: dir });
+    const saveTool = findTool(tools, 'memory_s3_save');
+    const target = await saveTool.execute({ type: 'project', title: '被引用条目', content: 'c' }, EXEC());
+    const source = await saveTool.execute(
+      { type: 'project', title: '引用方', content: 'c', links: [target.entry.id] },
+      EXEC(),
+    );
+    const backlinksTool = findTool(tools, 'memory_s3_backlinks');
+    const bl = await backlinksTool.execute({ id: target.entry.id }, EXEC());
+    assert.equal(bl.ok, true);
+    assert.equal(bl.total, 1);
+    assert.equal(bl.entries[0].id, source.entry.id);
+    assert.equal(bl.entries[0].title, '引用方');
+    assert.equal(bl.stale, false);
+    // 删除来源（引用方）→ removeForward 清其出链 → 反链消失。
+    const deleteTool = findTool(tools, 'memory_s3_delete');
+    const del = await deleteTool.execute({ id: source.entry.id }, EXEC());
+    assert.equal(del.ok, true);
+    const bl2 = await backlinksTool.execute({ id: target.entry.id }, EXEC());
+    assert.equal(bl2.total, 0, '来源删除后反链消失');
+    // 无效 id → ok:false INVALID_INPUT（空串穿过 schema 被 service 拦截）。
+    const bad1 = await backlinksTool.execute({ id: '' }, EXEC());
+    assert.equal(bad1.ok, false);
+    assert.equal(bad1.error.code, 'INVALID_INPUT');
+    // 非字符串 id：工具 schema 层即拦截（INVALID_ARGS，非 ok:false 路径）。
+    await assert.rejects(backlinksTool.execute({ id: 42 }, EXEC()), (err) => err.code === 'INVALID_ARGS');
+    // service 层防御：绕过 schema 直调 linkedTo 同样抛 INVALID_INPUT。
+    const service = provided.get('memoryS3');
+    assert.throws(() => service.linkedTo(42), (err) => err.code === 'INVALID_INPUT');
+    assert.throws(() => service.linkedTo(''), (err) => err.code === 'INVALID_INPUT');
+  } finally {
+    restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('memory_s3_backlinks：目标删除后悬空引用保留（入边不清理，渲染容错）', async () => {
+  const dir = tempDir();
+  const records = [];
+  const restore = installFetchMock(records);
+  try {
+    const { ctx, tools } = makeCtx();
+    apply(ctx, { bucket: 'mem', cacheDir: dir });
+    const saveTool = findTool(tools, 'memory_s3_save');
+    const target = await saveTool.execute({ type: 'project', title: '被引用条目', content: 'c' }, EXEC());
+    const source = await saveTool.execute(
+      { type: 'project', title: '引用方', content: 'c', links: [target.entry.id] },
+      EXEC(),
+    );
+    // 删除目标（被引用方）：removeForward 只清目标的出链，入边保留（悬空引用）。
+    const deleteTool = findTool(tools, 'memory_s3_delete');
+    const del = await deleteTool.execute({ id: target.entry.id }, EXEC());
+    assert.equal(del.ok, true);
+    const backlinksTool = findTool(tools, 'memory_s3_backlinks');
+    const bl = await backlinksTool.execute({ id: target.entry.id }, EXEC());
+    assert.equal(bl.total, 1, '目标已删仍返回来源（悬空引用容错）');
+    assert.equal(bl.entries[0].id, source.entry.id);
+  } finally {
+    restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('快照分层注入：Bonds 在前 → Moments 次之 → Facts 最后；locked 低重要入选；→关联 标记', async () => {
+  const dir = tempDir();
+  const records = [];
+  const restore = installFetchMock(records);
+  try {
+    const { ctx, tools, sections } = makeCtx();
+    apply(ctx, { bucket: 'mem', cacheDir: dir });
+    const saveTool = findTool(tools, 'memory_s3_save');
+    await saveTool.execute({ type: 'preference', title: '暗号之约', content: 'risu 应声', importance: 5, links: ['ghost'] }, EXEC());
+    await saveTool.execute({ type: 'preference', title: '锁定低优', content: 'c', importance: 1, locked: true }, EXEC());
+    await saveTool.execute({ type: 'moment', title: '漂流瓶', content: '投进海里', importance: 4 }, EXEC());
+    await saveTool.execute({ type: 'moment', title: '婚礼', content: 'α-2 世界线', importance: 2 }, EXEC());
+    await saveTool.execute({ type: 'project', title: '实验进度', content: 'D-Mail 已发送', importance: 4 }, EXEC());
+    await saveTool.execute({ type: 'history', title: '低重要历史', content: 'c', importance: 1 }, EXEC());
+
+    const text = sections[0].text({ agent: { session: { id: 'snap-layer', header: {} } } });
+    const lines = text.split('\n');
+    const idx = (title) => lines.findIndex((l) => l.includes(title));
+    assert.ok(idx('暗号之约') >= 0 && idx('锁定低优') >= 0, 'locked 低 importance 也入选（Bonds 守护层）');
+    assert.ok(idx('漂流瓶') >= 0 && idx('婚礼') >= 0, 'moment 类（含低重要）入选');
+    assert.ok(idx('实验进度') >= 0, 'fact 入选');
+    assert.equal(idx('低重要历史'), -1, '低 importance 非 moment 非 locked → 不入选');
+    assert.ok(idx('暗号之约') < idx('漂流瓶'), 'Bonds 在 Moments 之前');
+    assert.ok(idx('漂流瓶') < idx('实验进度'), 'Moments 在 Facts 之前');
+    // 渲染：含 links 的条目行尾带 →关联N 标记。
+    const bondLine = lines[idx('暗号之约')];
+    assert.match(bondLine, /→关联1/, 'links 非空 → 行尾 →关联1 标记');
+    // 默认预算 cap=5：2 Bonds + 2 Moments + 1 Fact。
+    assert.equal(lines.filter((l) => l.startsWith('- [')).length, 5);
+    assert.match(lines[0], /synced/, '首行快照头');
+  } finally {
+    restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('快照预算截断：maxInjectedItems 限制总注入数；Bonds 保底 40% 且按 importance 取 top', async () => {
+  const dir = tempDir();
+  const records = [];
+  const restore = installFetchMock(records);
+  try {
+    const { ctx, tools, sections } = makeCtx();
+    apply(ctx, { bucket: 'mem', cacheDir: dir, maxInjectedItems: 2 });
+    const saveTool = findTool(tools, 'memory_s3_save');
+    await saveTool.execute({ type: 'preference', title: '约定一', content: 'c', importance: 5 }, EXEC());
+    await saveTool.execute({ type: 'preference', title: '约定二', content: 'c', importance: 4 }, EXEC());
+    await saveTool.execute({ type: 'preference', title: '约定三', content: 'c', importance: 3 }, EXEC());
+    const text = sections[0].text({ agent: { session: { id: 'snap-cap', header: {} } } });
+    const lines = text.split('\n').filter((l) => l.startsWith('- ['));
+    assert.equal(lines.length, 2, 'cap=2 → 只注入 2 条');
+    assert.ok(lines[0].includes('约定一'), 'bond 按 importance 排序取 top');
+    assert.ok(!text.includes('约定三'), '超出预算的条目被截断');
+  } finally {
+    restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('反链持久化：save 后同 dir 新实例 apply → backlinks 索引从磁盘恢复', async () => {
+  const dir = tempDir();
+  const records = [];
+  const restore = installFetchMock(records);
+  try {
+    // 第一实例：写正向链接，backlinks.json 落盘。
+    const { ctx, tools } = makeCtx();
+    apply(ctx, { bucket: 'mem', cacheDir: dir });
+    const saveTool = findTool(tools, 'memory_s3_save');
+    const target = await saveTool.execute({ type: 'project', title: '目标条目', content: 'c' }, EXEC());
+    const source = await saveTool.execute({ type: 'project', title: '来源条目', content: 'c', links: [target.entry.id] }, EXEC());
+    assert.ok(existsSync(join(dir, 'backlinks.json')), '反链索引已落盘');
+    // 第二实例（同 dir）：缓存与反链索引均从磁盘恢复。
+    const ctx2 = makeCtx();
+    apply(ctx2.ctx, { bucket: 'mem', cacheDir: dir });
+    const backlinksTool = findTool(ctx2.tools, 'memory_s3_backlinks');
+    const bl = await backlinksTool.execute({ id: target.entry.id }, EXEC());
+    assert.equal(bl.ok, true);
+    assert.equal(bl.total, 1, '新实例从磁盘恢复反链索引');
+    assert.equal(bl.entries[0].id, source.entry.id);
+    assert.equal(bl.entries[0].title, '来源条目');
   } finally {
     restore();
     rmSync(dir, { recursive: true, force: true });

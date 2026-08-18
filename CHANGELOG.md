@@ -5,6 +5,26 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Added
+
+- **记忆模型 v2.1 升级**（feat，2026-08-18；设计定稿 docs/MODEL.md）：
+  - 类型新增 `moment`（共 5 类：preference/project/decision/history/moment，对应 Tulving 情景记忆——时刻/照片/纪念日）——存量四类型语义不动，moment 对旧数据零影响（兼容演进）
+  - 条目新增可选四字段：`subject`（主体）/ `timeline`（时间线归属）/ `links`（关联引用）/ `locked`（锁定保护，默认 false 恒落盘，其余缺省不落盘）——validate/normalize/toJSON/fromJSON 全链路 + types.d.ts 契约落地（lib/entry.mjs）
+  - 新模块 `lib/backlinks.mjs`：反链索引（内存 Map + `backlinks.json` 0600 持久化，替换语义，写入时自动回填）——被引用的反链**不落条目字段、不写 S3 对象**（引用即链接，Obsidian/Zettelkasten 心智）
+  - 新工具 `memory_s3_backlinks`：查询「谁引用了该条目」（读路径无审批，读本地索引）——**工具总数 12 → 13**；对应服务方法 `service.linkedTo(id)`
+  - **locked 合并保护**：locked 条目跳过同 (type,title) 自动合并（本地查重 + 远端预检 + CONFLICT 读回均跳过）；显式 update/remove 仍过审批门——审批是主人意志的闸门，locked 防的是模型无意自动覆盖
+  - **快照分层注入**：冻结快照按 Bonds（locked / preference importance≥5，保底 40% 预算）→ Moments（moment 按新近）→ Facts（importance 降序、同分按被引用数/图中心性）三层投影；带 links 条目行尾自动标记 `→关联N`
+  - `memory_s3_save` / `memory_s3_update` 工具参数新增 subject/timeline/links/locked（links 替换语义；更新时反链索引自动刷新）
+
+### 规划中（Initiation 完成）
+
+- 需求分析定稿（docs/requirements.md）
+- 技术选型终审（docs/TECH_STACK.md）：自实现 SigV4 / 每记忆一对象 / 零依赖向量
+- 架构设计定稿（docs/ARCHITECTURE.md）
+- 安全设计（docs/SECURITY.md）
+
 ## [0.1.1] - 2026-08-18
 
 ### Added
@@ -25,15 +45,6 @@
 ### Fixed（真实 DSH 会话复验暴露，2026-08-18）
 
 - **`memory_s3_forget` 反馈文案**：render 原用 `importance >= 0`（恒真）导致无论 `forgotten:true/false` 都显示 "injection suppressed"——改为读取调用参数，`forgotten:false` 正确回显 "restored"；render 断言（suppressed/restored/default 三态）补入测试
-
-## [Unreleased]
-
-### 规划中（Initiation 完成）
-
-- 需求分析定稿（docs/requirements.md）
-- 技术选型终审（docs/TECH_STACK.md）：自实现 SigV4 / 每记忆一对象 / 零依赖向量
-- 架构设计定稿（docs/ARCHITECTURE.md）
-- 安全设计（docs/SECURITY.md）
 
 ## [0.1.0] - 未发布
 

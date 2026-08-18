@@ -1,7 +1,8 @@
 # dsh-memory-s3（记忆S3）需求分析
 
-> 状态：Initiation（v0.1 draft）｜日期：2026-08-17
+> 状态：Initiation（v0.1 draft）｜日期：2026-08-17（记忆模型 v2.1 增补 2026-08-18）
 > 作者：Hououin Kyouma（未来道具研究所，Lab Member No.001）
+> 记忆模型 v2.1 设计定稿见 docs/MODEL.md。
 
 ---
 
@@ -10,7 +11,7 @@
 ### What
 `dsh-memory-s3` 是一个 **DeepSeek Harness (DSH) 记忆插件**，将 agent 的跨会话记忆持久化到 **S3 兼容对象存储**（AWS S3 / MinIO / Cloudflare R2 / 阿里云 OSS），提供：
 
-- **结构化记忆条目**：类型化事实/偏好/决策/项目状态/会话摘要，带元数据（importance/tags/source/timestamps）
+- **结构化记忆条目**：类型化事实/偏好/决策/项目状态/时刻/会话摘要，带元数据（importance/tags/source/timestamps + 可选 subject/timeline/links/locked）
 - **向量语义检索**：嵌入向量 + 余弦相似度召回，与关键词过滤混合
 - **本地缓存层**：减少 S3 往返，离线时优雅降级为只读缓存视图
 - **写入审批门**：所有写入强制经过 DSH approval seam，可审计、可重建
@@ -31,12 +32,12 @@
 
 ### 目标（In scope）
 1. S3 兼容存储后端：条目 CRUD + 清单管理 + 乐观并发控制
-2. 结构化记忆模型：`preference | project | decision | history` 四类条目
+2. 结构化记忆模型：`preference | project | decision | history | moment` 五类条目（v2.1 新增 moment 时刻类，对应 Tulving 情景记忆）
 3. 向量语义检索：可插拔嵌入器 + 余弦 top-k + 元数据过滤
 4. 本地缓存与离线降级：LRU 条目缓存 + 清单缓存；离线只读
 5. 写入治理：DSH approval seam 审批门（service 内部强制点）+ 审计
 6. 上下文注入：会话级冻结快照（跨会话记忆进入 systemPrompt）
-7. 模型工具面：save/search/recall/list/update/delete/forget/attach/get_file/detach/sync/status（12 工具）
+7. 模型工具面：save/search/backlinks/recall/list/update/delete/forget/attach/get_file/detach/sync/status（13 工具）
 8. 照片/文件附件：图片/PDF/压缩包/文本可挂载入条目，检索/快照可见元数据；本地文件三重校验（白名单/魔数/大小）
 9. 会话摘要归档：会话结束自动提炼 → 待审提案（骨架阶段可选）
 
@@ -66,7 +67,7 @@
 | # | 功能 | 说明 | 优先级 |
 |---|---|---|---|
 | F1 | S3 存储层 | bucket/prefix 配置、Get/Put/Delete/List/Head、自定义 endpoint（MinIO/R2/OSS） | P0 |
-| F2 | 条目模型 | type/title/content/tags/importance/source/embedding/timestamps/version | P0 |
+| F2 | 条目模型 | type/title/content/tags/importance/source/embedding/timestamps/version + 可选 subject/timeline/links/locked（v2.1 四字段） | P0 |
 | F3 | CRUD 工具 | `memory_s3_save/search/recall/list/update/delete/forget` | P0 |
 | F4 | 审批门 | 写操作强制 `ctx.approval.request`（ask/auto/off 策略） | P0 |
 | F5 | 注入 | 会话冻结快照注入 systemPrompt（含预算头） | P0 |
@@ -77,6 +78,7 @@
 | F10 | 会话摘要 | 会话结束 → LLM 提炼 → 待审提案 | P2 |
 | F11 | 状态面板 | `memory_s3_status` + Web 只读面板 | P2 |
 | F12 | 照片/文件附件 | `save` 携附件 / `memory_s3_attach` / `memory_s3_get_file` / `memory_s3_detach`；二进制存 `files/{id}` 不可变对象，条目只存元数据；扩展名白名单 + 魔法字节 + 大小上限三重校验 | P1 |
+| F13 | 记忆模型 v2.1 | 类型新增 `moment`（共 5 类，对应 Tulving 情景记忆）；可选四字段 subject/timeline/links/locked 全链路；反链索引（lib/backlinks.mjs → 本地 backlinks.json，写 links 自动回填入边）+ `memory_s3_backlinks` 工具（工具总数 13）；locked 合并保护（跳过同 title 自动合并，显式写仍过审批门）；快照分层注入（Bonds 保底 40% → Moments 按新近 → Facts 按重要性，带 links 行尾 `→关联N` 标记，被引用数作排序信号） | P1 |
 
 ## 5. 约束条件（Constraints）
 

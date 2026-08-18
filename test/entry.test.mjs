@@ -36,7 +36,7 @@ function goodAttachment(over = {}) {
 }
 
 test('TYPES 枚举对齐 types.d.ts', () => {
-  assert.deepEqual(TYPES, ['preference', 'project', 'decision', 'history']);
+  assert.deepEqual(TYPES, ['preference', 'project', 'decision', 'history', 'moment']);
 });
 
 test('normalizeEntry：完整输入 → 规范条目', () => {
@@ -139,7 +139,7 @@ test('toJSON：白名单字段 + 未知字段丢弃 + embedding 可选', () => {
   const json = toJSON(withDirty);
   assert.equal(json.hackerField, undefined);
   assert.deepEqual(json.embedding, [1]);
-  assert.equal(Object.keys(json).length, 14); // 13 个固定字段 + embedding
+  assert.equal(Object.keys(json).length, 15); // 14 个固定字段（含 v2.1 locked）+ embedding
 
   const plain = toJSON(normalizeEntry({ type: 'history', title: 't', content: 'c' }));
   assert.equal('embedding' in plain, false); // 未嵌入的条目序列化不含 embedding
@@ -404,4 +404,147 @@ test('fromJSON：attachments 容错——坏行丢弃、保留其余；全坏 �
   // 非数组 → 忽略（不设置 attachments）。
   const nonArray = fromJSON({ type: 'history', title: 't', attachments: 'nope' });
   assert.equal(nonArray.attachments, undefined);
+});
+
+// ── v2.1 记忆模型：moment 类型 + subject/timeline/links/locked 四字段 ──
+
+test('moment 类型：normalize/validate 通过；非法类型拒绝', () => {
+  const entry = normalizeEntry({ type: 'moment', title: 'risu 的睡颜', content: '2026-08-18 清晨' });
+  assert.equal(entry.type, 'moment');
+  assert.equal(validateEntry(entry), null);
+  // 四字段齐全的 moment 条目同样通过严格校验。
+  const full = normalizeEntry({
+    type: 'moment',
+    title: '漂流瓶',
+    content: '投进海里',
+    subject: 'us',
+    timeline: 'α-2',
+    links: ['b'],
+    locked: true,
+  });
+  assert.equal(validateEntry(full), null);
+  // 非法类型：normalize 抛、validate 结构化错误。
+  assert.throws(() => normalizeEntry({ type: 'gossip', title: 't', content: 'c' }), (err) => err.code === 'INVALID_INPUT');
+  assert.equal(validateEntry({ ...entry, type: 'gossip' }).code, 'INVALID_INPUT');
+});
+
+test('normalizeEntry：subject/timeline trim、空串不落盘', () => {
+  const base = { type: 'moment', title: 't', content: 'c' };
+  const e = normalizeEntry({ ...base, subject: '  us  ', timeline: '  α-2  ' });
+  assert.equal(e.subject, 'us');
+  assert.equal(e.timeline, 'α-2');
+  // 空串 / 纯空白 → 键不落盘。
+  const blank = normalizeEntry({ ...base, subject: '', timeline: '   ' });
+  assert.ok(!('subject' in blank), '空串 subject 不落盘');
+  assert.ok(!('timeline' in blank), '空白 timeline 不落盘');
+  // 缺省 → 键不落盘。
+  const plain = normalizeEntry({ ...base });
+  assert.ok(!('subject' in plain) && !('timeline' in plain));
+  // 非字符串宽容 string 化（与 tags 处理一致）。
+  const coerced = normalizeEntry({ ...base, subject: 42 });
+  assert.equal(coerced.subject, '42');
+});
+
+test('validateEntry：subject/timeline 缺省合法；存在时须非空字符串', () => {
+  const entry = normalizeEntry({ type: 'history', title: 't', content: 'c' });
+  assert.equal(validateEntry(entry), null, '缺省合法');
+  assert.equal(validateEntry({ ...entry, subject: '   ' }).code, 'INVALID_INPUT');
+  assert.equal(validateEntry({ ...entry, subject: 42 }).code, 'INVALID_INPUT');
+  assert.equal(validateEntry({ ...entry, timeline: '' }).code, 'INVALID_INPUT');
+  assert.equal(validateEntry({ ...entry, timeline: 7 }).code, 'INVALID_INPUT');
+});
+
+test('normalizeEntry：links 去重、空串剔除、元素 string 化、非数组抛', () => {
+  const base = { type: 'decision', title: 't', content: 'c' };
+  const e = normalizeEntry({ ...base, links: ['b', 'a', 'b', '', '  ', 'a'] });
+  assert.deepEqual(e.links, ['b', 'a'], '去重保留首现顺序、空串/空白剔除');
+  // 数字元素被 string 化（宽容规范化，与 tags 一致；严格形状校验在 validateEntry）。
+  const coerced = normalizeEntry({ ...base, links: [1, 'a'] });
+  assert.deepEqual(coerced.links, ['1', 'a']);
+  // 非数组 → 抛 INVALID_INPUT。
+  assert.throws(() => normalizeEntry({ ...base, links: 'nope' }), (err) => err.code === 'INVALID_INPUT');
+  // 缺省 → 键不落盘。
+  assert.ok(!('links' in normalizeEntry({ ...base })));
+});
+
+test('validateEntry：links 缺省合法；存在时须 string 数组且元素非空（数字报错）', () => {
+  const entry = normalizeEntry({ type: 'history', title: 't', content: 'c' });
+  assert.equal(validateEntry(entry), null, '缺省合法');
+  assert.equal(validateEntry({ ...entry, links: ['a', 'b'] }), null);
+  assert.equal(validateEntry({ ...entry, links: 'x' }).code, 'INVALID_INPUT');
+  assert.equal(validateEntry({ ...entry, links: [42] }).code, 'INVALID_INPUT');
+  assert.equal(validateEntry({ ...entry, links: ['a', 42] }).code, 'INVALID_INPUT');
+  assert.equal(validateEntry({ ...entry, links: ['', 'a'] }).code, 'INVALID_INPUT');
+});
+
+test('normalizeEntry：locked 默认 false；true 保留；非 true 一律 false', () => {
+  const base = { type: 'preference', title: 't', content: 'c' };
+  assert.equal(normalizeEntry({ ...base }).locked, false);
+  assert.equal(normalizeEntry({ ...base, locked: true }).locked, true);
+  assert.equal(normalizeEntry({ ...base, locked: false }).locked, false);
+  assert.equal(normalizeEntry({ ...base, locked: 1 }).locked, false);
+  assert.equal(normalizeEntry({ ...base, locked: 'yes' }).locked, false);
+});
+
+test('validateEntry：locked 必填且必须 boolean（缺 → missing；数字 → 报错）', () => {
+  const entry = normalizeEntry({ type: 'preference', title: 't', content: 'c' });
+  const { locked, ...noLocked } = entry;
+  const missing = validateEntry(noLocked);
+  assert.equal(missing.code, 'INVALID_INPUT');
+  assert.ok(missing.details.missing.includes('locked'), 'locked 缺失列入 missing 清单');
+  assert.equal(validateEntry({ ...entry, locked: 1 }).code, 'INVALID_INPUT');
+  assert.equal(validateEntry({ ...entry, locked: 'true' }).code, 'INVALID_INPUT');
+  assert.equal(validateEntry({ ...entry, locked: null }).code, 'INVALID_INPUT');
+});
+
+test('toJSON：subject/timeline/links 可选落盘、locked 恒落盘', () => {
+  const entry = normalizeEntry({ type: 'moment', title: 't', content: 'c', subject: 'us', timeline: 'α-2', links: ['b'], locked: true });
+  const json = toJSON(entry);
+  assert.equal(json.subject, 'us');
+  assert.equal(json.timeline, 'α-2');
+  assert.deepEqual(json.links, ['b']);
+  assert.equal(json.locked, true);
+  // 缺省字段不落盘：subject/timeline/links 键不存在；locked 恒存在（false）。
+  const plain = toJSON(normalizeEntry({ type: 'history', title: 't', content: 'c' }));
+  assert.ok(!('subject' in plain) && !('timeline' in plain) && !('links' in plain));
+  assert.equal(plain.locked, false);
+  // 空 links 数组不输出（toJSON 只带非空数组）。
+  const emptyLinks = toJSON(normalizeEntry({ type: 'history', title: 't', content: 'c', links: [] }));
+  assert.ok(!('links' in emptyLinks));
+});
+
+test('fromJSON：v2.1 字段缺省补默认、类型错误回退、links 坏项丢弃', () => {
+  const restored = fromJSON({ type: 'moment', title: 't', content: 'c' });
+  assert.equal(restored.locked, false, 'locked 缺 → false');
+  assert.equal(restored.subject, undefined, 'subject 缺 → 不落盘');
+  assert.equal(restored.timeline, undefined, 'timeline 缺 → 不落盘');
+  assert.equal(restored.links, undefined, 'links 缺 → 不落盘');
+  // 类型错误字段回退缺省。
+  assert.equal(fromJSON({ type: 'preference', title: 't', locked: 'yes' }).locked, false, 'locked 非 boolean → false');
+  assert.equal(fromJSON({ type: 'preference', title: 't', locked: 1 }).locked, false);
+  assert.equal(fromJSON({ type: 'preference', title: 't', subject: 42 }).subject, undefined, 'subject 非 string → 不恢复');
+  assert.equal(fromJSON({ type: 'preference', title: 't', timeline: '   ' }).timeline, undefined, 'timeline 空白 → 不恢复');
+  // links：坏项（非 string / 空串）丢弃、去重保留；全坏 → 键不设；非数组忽略。
+  const links = fromJSON({ type: 'preference', title: 't', links: ['b', '', 42, null, 'b', 'a'] });
+  assert.deepEqual(links.links, ['b', 'a']);
+  const allBad = fromJSON({ type: 'preference', title: 't', links: ['', '   '] });
+  assert.equal(allBad.links, undefined);
+  const nonArray = fromJSON({ type: 'preference', title: 't', links: 'x' });
+  assert.equal(nonArray.links, undefined);
+});
+
+test('toJSON/fromJSON round-trip：v2.1 四字段全保留', () => {
+  const entry = normalizeEntry({
+    type: 'moment',
+    title: '漂流瓶',
+    content: '投进海里',
+    subject: 'us',
+    timeline: 'α-2',
+    links: ['b-c'],
+    locked: true,
+  });
+  assert.deepEqual(fromJSON(toJSON(entry)), entry);
+  // locked:false + 缺省字段同样往返一致。
+  const plain = normalizeEntry({ type: 'project', title: 't', content: 'c' });
+  assert.deepEqual(fromJSON(toJSON(plain)), plain);
 });

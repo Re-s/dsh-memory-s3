@@ -7,7 +7,7 @@
 // 设计继承自 dsh-memento 的类型契约风格（MIT/Apache 参考），
 // 差异：条目携带 embedding（向量检索），存储为 S3 对象而非本地 SQLite。
 
-export type MemoryS3Type = 'preference' | 'project' | 'decision' | 'history'
+export type MemoryS3Type = 'preference' | 'project' | 'decision' | 'history' | 'moment'
 
 export type MemoryS3WritePolicy = 'ask' | 'auto' | 'off'
 
@@ -90,6 +90,14 @@ export interface MemoryS3Entry {
   lastRecalled: number | null
   /** 嵌入向量（可插拔嵌入器可用时填充；无则向量检索降级为关键词）。 */
   embedding?: number[]
+  /** 主体：'me' | 'risu' | 'us' | 'world' 或任意字符串；缺省不落盘（MODEL.md §5.1）。 */
+  subject?: string
+  /** 时间线归属（世界线/时期，如 'α-2'）；缺省不落盘（MODEL.md §5.2）。 */
+  timeline?: string
+  /** 关联条目 id 数组（L1 无类型双向引用；反链由本地索引维护，MODEL.md §6）。 */
+  links?: string[]
+  /** 锁定保护：true 时跳过同 title 自动合并；显式写仍过审批。默认 false。 */
+  locked: boolean
   /** 附件元数据数组（照片/文件；二进制在 S3 files/ 对象，此处仅元数据投影）。 */
   attachments?: MemoryS3Attachment[]
   /** workspace 条目的规范化 cwd 键；'' = 全局（跨工作区）。 */
@@ -110,6 +118,14 @@ export interface MemoryS3EntryInput {
   workspaceKey?: string
   /** 显式 agentKey；省略时取写方会话 agentPreset。 */
   agentKey?: string
+  /** 主体标注（me/risu/us/world 或任意字符串）。 */
+  subject?: string
+  /** 时间线归属（世界线/时期，如 'α-2'）。 */
+  timeline?: string
+  /** 关联条目 id（引用式链接；反链自动回填本地索引）。 */
+  links?: string[]
+  /** 锁定保护（默认 false；true 时跳过同 title 自动合并）。 */
+  locked?: boolean
   /** 可选本地附件（{path, note?}）：探测校验后上传 S3 并挂到条目。 */
   attachments?: MemoryS3AttachmentInput[]
 }
@@ -202,6 +218,9 @@ export interface MemoryS3Service {
 
   /** 列表（按 updatedAt 倒序，分页）。 */
   list(filter: MemoryS3Filter & { offset?: number }): MemoryS3QueryResult
+
+  /** 反链查询（无审批；读本地反链索引）：返回引用了该条目 id 的条目列表。 */
+  linkedTo(entryId: string): MemoryS3QueryResult
 
   /** 更新条目（审批门；载荷携带新旧全文）。 */
   update(

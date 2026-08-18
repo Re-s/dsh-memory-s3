@@ -1,7 +1,7 @@
 # dsh-memory-s3（记忆S3）架构设计
 
-> 状态：Initiation（v0.1 draft）｜日期：2026-08-17（附件能力增补 2026-08-18）
-> 本文档描述模块边界、数据流、S3 对象布局、同步投影机制与安全模型。技术选型结论见 TECH_STACK.md。
+> 状态：Initiation（v0.1 draft）｜日期：2026-08-17（附件能力增补 2026-08-18；记忆模型 v2.1 增补 2026-08-18，design 依据 docs/MODEL.md）
+> 本文档描述模块边界、数据流、S3 对象布局、同步投影机制与安全模型。技术选型结论见 TECH_STACK.md，记忆模型设计定稿见 MODEL.md。
 
 ---
 
@@ -12,8 +12,8 @@
 │ DSH Harness (Cordis 4, rc.6)                                            │
 │                                                                          │
 │  Consumer 面：                                                            │
-│   ├ ctx.tools        memory_s3_save/search/recall/list/update/delete/    │
-│   │                  forget/attach/get_file/detach/sync/status            │
+│   ├ ctx.tools        memory_s3_save/search/backlinks/recall/list/update/  │
+│   │                  delete/forget/attach/get_file/detach/sync/status      │
 │   ├ ctx.systemPrompt 冻结快照段（order=-50，同步提供者 + WeakMap 冻结）    │
 │   └ ctx.webServer    只读状态面板（骨架阶段：status 接口）                 │
 └──────────────┬───────────────────────────────────────────────────────────┘
@@ -22,7 +22,7 @@
 ┌────────────────────────────────────────────────────────────────────────┐
 │ Service Definition：ctx.memoryS3（index.mjs）                            │
 │  save() search() recall() list() update() remove() forget() sync()       │
-│  status() attach() detach() getFile()                                    │
+│  status() attach() detach() getFile() linkedTo()                         │
 │  写路径（审批门不可绕过）：                                                │
 │    嵌入(异步) ─▶ 预算/去重预检 ─▶ ctx.approval.request ─▶ 落盘 S3 ─▶ 审计  │
 │    附件路径：本地探测(filemeta)─▶ 审批(元数据摘要)─▶ 上传 files/{id} ─▶ 条目│
@@ -35,7 +35,8 @@
 │  cache.mjs      本地缓存：索引 JSON + 条目 LRU（内存/磁盘）                │
 │  embedder.mjs   嵌入接口 + OpenAI 兼容实现（fetch）                       │
 │  vector.mjs     余弦相似度 top-k + 元数据过滤（纯 JS）                    │
-│  entry.mjs      条目模型校验/规范化/序列化（含附件元数据）                 │
+│  entry.mjs      条目模型校验/规范化/序列化（含附件元数据 + v2.1 四字段）    │
+│  backlinks.mjs  反链索引（links 入边镜像，本地 backlinks.json 持久化）      │
 │  filemeta.mjs   附件探测：白名单/魔数嗅探/大小上限/sha256（纯 node）       │
 │  gate.mjs       审批门策略封装（reason 编解码）                           │
 │  audit.mjs      审计账本（JSONL 追加，本地）                              │
@@ -67,6 +68,7 @@
 - 冻结语义 = 会话内快照文本不变（前缀缓存稳定）。
 - 快照文本同时落本地 audit 账本 + 经 `request/header.system` 入会话日志——两条独立证据链可重建（S2 不变量）。
 - 快照头携带同步状态与预算用量（`[记忆S3] 已同步 2026-08-17T12:00Z · 3/5 条`）。
+- 快照内容 = **分层注入**（v2.1，见 D9）：Bonds 保底 → Moments → Facts，由 `maxInjectedItems` 预算控制。
 
 ### D4. 混合检索引擎 = 向量余弦 top-k + 元数据过滤 + 关键词子串
 - **向量**：嵌入器（可插拔）→ 余弦相似度 top-k（≤10k 条纯内存暴力足够，见 TECH_STACK 性能估算）。
@@ -99,6 +101,19 @@
 - 可重试错误（网络抖动/5xx）指数退避最多 3 次；仍失败 → 写标记 pending（骨架阶段仅日志），读走缓存降级并标注 stale。
 - 加载期校验：bucket/prefix/endpoint 非法配置响亮失败（schemastery schema 层双保险）；`maxFileBytes` 非正数 / `allowedFileTypes` 空串成员同样响亮失败（SECURITY.md §8）。
 
+### D9. 记忆模型 v2.1：五类型 + 四字段 + 反链 + 分层注入（design 定稿 docs/MODEL.md）
+
+- **类型五类**：`preference | project | decision | history | moment`（moment = 情景记忆，Timeline：时刻/照片/纪念日；与语义三类分型对应 Tulving 三分法）。存量四类型语义不变，moment 对旧数据零影响（兼容演进）。
+- **四维字段全可选**：`subject`（主体）/ `timeline`（时间线归属）/ `links`（关联条目 id）/ `locked`（锁定保护，默认 false 恒落盘，其余缺省不落盘）。save/update 工具与 ENTRY_OUTPUT 全链路支持（MODEL.md §5）。
+- **locked 合并保护**：locked 条目跳过同 (type,title) 自动合并——本地查重（`#findByTitle`）与远端预检（`#findRemoteByTitle` / CONFLICT 读回）均跳过；显式 update/remove 仍过审批门（防的是模型无意自动覆盖，不是主人意志）。
+- **反链索引（L1 无类型双向引用）**：条目 A 的 `links` 含 B → 本地索引记 B 的入边含 A（MODEL.md §6）。写入路径 `service.save/update` 落条目后调 `lib/backlinks.addForward`（替换语义：先清旧出链再写新边），`remove` 调 `removeForward` 清出链；索引持久化 `cacheDir/backlinks.json`（0600），损坏降级为空不阻塞启动。**不落盘条目字段、不写 S3**——S3 对象依旧只有正向声明（引用即链接，Obsidian/Zettelkasten 心智）。查询面：`service.linkedTo(id)` → `memory_s3_backlinks` 工具（读路径，无审批）；悬空引用（目标已删）容错跳过。
+- **分层快照注入**（service.snapshotText，index.mjs）：三层三桶 + 预算填充：
+  1. **Bonds**：`locked` 或 `preference importance≥5`（约定守护型，永不沉底），保底 `max(1, ceil(cap×0.4))` 条（40% 预算）；
+  2. **Moments**：`type=moment` 按 `updatedAt` 新近（情景记忆易逝，优先呈现近期时刻）；
+  3. **Facts**：其余 importance ≥ threshold 条目，按 importance 降序、同分按被引用数（图中心性信号，`backlinks.allCounts()`）。
+  行尾标记：带附件 → ` 📎文件名`（48 字符截断，v0.1）；带 links → ` →关联N`（出链数，v2.1）。
+- **图中心性**：被引用数是 Bonds/Facts 排序的信号（MODEL.md §8：注入分数含关系度；双链笔记"被引用数 = 注入优先级"心智）——L1 用计数，L2 规划 1-2 跳邻接摘要注入。
+
 ## 3. S3 对象布局（实证自 S3 调研子代理）
 
 ```
@@ -106,7 +121,7 @@ s3://<bucket>/<prefix>/
 ├── memories/
 │   ├── {kind}/
 │   │   └── <entry-id>.json      # 条目全文（含 embedding 数组 + 可选 attachments 元数据数组）
-│   │                            # kind = preference|project|decision|history
+│   │                            # kind = preference|project|decision|history|moment
 │   └── _meta/
 │       └── index.json           # 可选清单（仅"全量遍历"场景才建；骨架阶段不建）
 └── files/
@@ -138,16 +153,20 @@ s3://<bucket>/<prefix>/
 ```json
 {
   "id": "uuid",
-  "type": "preference",
-  "title": "语言",
-  "content": "用户用中文交流",
-  "tags": ["偏好"],
-  "importance": 5,
+  "type": "moment",
+  "title": "risu 的睡颜",
+  "content": "2026-08-18 午后…",
+  "tags": ["时刻"],
+  "importance": 4,
   "source": "tool",
   "createdAt": 1789000000000,
   "updatedAt": 1789000000000,
   "recallCount": 0,
   "lastRecalled": null,
+  "subject": "risu",            // 可选：主体（me | risu | us | world 或任意字符串）
+  "timeline": "α-2",            // 可选：时间线归属（α-2 | β | steins-gate | 2026-08）
+  "links": ["<other-entry-id>"],// 可选：关联条目 id（引用即链接；被引用方反链自动回填本地索引）
+  "locked": false,              // 必序列化字段：锁定保护（默认 false；跳过同 title 自动合并）
   "embedding": [0.0023, -0.011],
   "workspaceKey": "",
   "agentKey": "",
@@ -158,6 +177,8 @@ s3://<bucket>/<prefix>/
   ]
 }
 ```
+
+> 序列化规则（lib/entry.mjs toJSON）：`locked` 恒落盘（默认 false）；`subject`/`timeline` 仅在存在时落盘；`links` 仅在非空时落盘；`backlinks` **不落条目 JSON**——由本地索引（lib/backlinks.mjs → `cacheDir/backlinks.json`）维护，不污染 S3 对象（MODEL.md §5/§6）。
 
 **并发写协议**（条件写，无锁数据库语义）：
 1. **创建**：PutObject with `If-None-Match: *`；412/409（已存在）→ 读回合并或重试
@@ -178,6 +199,7 @@ index.mjs（唯一 DSH 依赖面：tools/systemPrompt/approval/on）
   ├── lib/embedder.mjs   ← fetch（可插拔）
   ├── lib/vector.mjs     ← 纯函数
   ├── lib/entry.mjs      ← 纯函数
+  ├── lib/backlinks.mjs  ← node:fs + node:path（反链索引，本地 JSON 持久化）
   ├── lib/filemeta.mjs   ← node:fs + node:crypto（附件探测）
   ├── lib/gate.mjs       ← 纯函数
   ├── lib/audit.mjs      ← node:fs（JSONL 追加）
@@ -233,12 +255,25 @@ memory_s3_sync 工具 / 启动预热 / 会话事件驱动
   → 变更则拉取增量条目 → 重建向量索引 → 更新缓存 + 审计
 ```
 
+### 反链数据流（v2.1：写 links → 本地反链索引 → linkedTo 查询）
+```
+memory_s3_save/update 写入 links（出链，替换语义）
+  → service 落条目后调 lib/backlinks.addForward(entryId, links)
+      （先清该条目旧出链，再写入边；自引用/坏 id 拒绝——MODEL.md §6 L1）
+  → 索引同步持久化 cacheDir/backlinks.json（0600；失败降级内存态）
+  → memory_s3_backlinks 工具 → service.linkedTo(id)
+      （读路径无审批；悬空目标不存在于缓存则跳过——容错）
+  → 快照注入读取 allCounts()（被引用数）作 Bonds/Facts 同分排序信号
+  → 渲染：带出链条目行尾标记 →关联N；带附件标记 📎文件名
+删除路径：service.remove 调 removeForward 清出链（目标侧悬空引用渲染容错）
+```
+
 ## 6. 安全模型
 
 | 面 | 措施 |
 |---|---|
 | 传输 | HTTPS 强制（S3 endpoint 与嵌入端点均为 https://） |
-| 静态 | 依赖 S3 服务端加密（SSE-S3 默认，可配 SSE-KMS）；本地缓存文件权限 0600（含下载附件） |
+| 静态 | 依赖 S3 服务端加密（SSE-S3 默认，可配 SSE-KMS）；本地缓存文件权限 0600（含下载附件与 backlinks.json） |
 | 凭据 | 仅环境变量/DSH 配置；不进条目/快照/审计；秘密检测器拒绝写入（含文本类附件内容） |
 | 附件 | 白名单制（11 种扩展名 + 魔数嗅探一致，SVG 拒绝）；大小上限 20MB（maxFileBytes 可配）；附件二进制不进审批 reason 与审计（只进元数据摘要）；下载 sha256 校验防篡改；文件名与对象键解耦（防路径注入/后缀伪装） |
 | 权限 | 最小权限 IAM/桶策略：仅单 prefix 读写（memories/* + files/*，TECH_STACK.md 附 policy 示例） |

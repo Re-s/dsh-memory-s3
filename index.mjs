@@ -47,6 +47,7 @@ import {
 import { bruteForceTopK } from './lib/vector.mjs';
 import { createCache } from './lib/cache.mjs';
 import { createAudit } from './lib/audit.mjs';
+import { createBacklinks } from './lib/backlinks.mjs';
 import { buildWriteReason, isOwnReason } from './lib/gate.mjs';
 import { strings } from './lib/strings.mjs';
 
@@ -84,9 +85,25 @@ function snippet(text, max = 200) {
   return text.length <= max ? text : `${text.slice(0, max)}…`;
 }
 
-/** 工具 render 的 content block 形状（dsh-tools 约定）。 */
+/** 摘要帧：工具 render 的 content block 形状（dsh-tools 约定）。 */
 function renderText(text) {
   return [{ type: 'text', text }];
+}
+
+/** links 清洗：string 化、去空、去自引用、去重（normalizeEntry 与 update patch 共用语义）。 */
+function sanitizeLinks(links, selfId) {
+  if (!Array.isArray(links)) {
+    throw domainError('INVALID_INPUT', 'links must be an array of entry id strings');
+  }
+  const seen = new Set();
+  const out = [];
+  for (const raw of links) {
+    const link = String(raw).trim();
+    if (link === '' || link === selfId || seen.has(link)) continue;
+    seen.add(link);
+    out.push(link);
+  }
+  return out;
 }
 
 /**
@@ -144,6 +161,8 @@ class MemoryS3Service {
     this.forgotten = new Set();
     /** 本地删除屏蔽集合（cache 无 deleteEntry API 的骨架替代，见文件头注释）。 */
     this.deleted = new Set();
+    /** 反链索引（links 入边镜像，本地持久化；MODEL.md §6 L1）。 */
+    this.backlinks = deps.backlinks;
     /** 附件上限与类型白名单（apply 层 resolved 传入；filemeta 默认兜底）。 */
     this.maxFileBytes = Number.isFinite(deps.config.maxFileBytes) && deps.config.maxFileBytes > 0
       ? deps.config.maxFileBytes
@@ -204,6 +223,10 @@ class MemoryS3Service {
       source: entry.source,
       workspaceKey,
       agentKey,
+      ...(entry.subject !== undefined ? { subject: entry.subject } : {}),
+      ...(entry.timeline !== undefined ? { timeline: entry.timeline } : {}),
+      ...(Array.isArray(entry.links) && entry.links.length > 0 ? { links: entry.links } : {}),
+      ...(entry.locked ? { locked: true } : {}),
       ...(entry.attachments !== undefined ? { attachments: this.#attachmentSummary(entry.attachments) } : {}),
     }, write);
     this.#throwIfAborted(write);
@@ -218,7 +241,7 @@ class MemoryS3Service {
       // 不同内容撞 id 绝不静默覆盖（乐观并发语义，ARCHITECTURE.md D6）。
       if (error?.code === 'CONFLICT') {
         const remote = await this.#readRemoteByType(entry.type, entry.id);
-        if (remote !== null && sameTitle(remote, entry)) {
+        if (remote !== null && sameTitle(remote, entry) && !remote.locked) {
           await this.#cleanupUploaded(files); // 合并路径会重传/重用：清理本次孤儿，避免重复对象
           return this.#mergeWithAttachments(remote, entry, files, write);
         }
@@ -227,6 +250,7 @@ class MemoryS3Service {
       throw error;
     }
     this.cache.putEntry(entry.id, entry);
+    this.backlinks?.addForward(entry.id, entry.links); // 反链索引：写正向链接，自动回填入边
     this.#auditWrite('save', entry, write, { attachments: entry.attachments?.length ?? 0 });
     this.#trace('save:ok', { id: entry.id, ms: Date.now() - t0 });
     return { action: 'created', entry };
@@ -264,6 +288,7 @@ class MemoryS3Service {
     this.deleted.add(existing.id);
     // 同步清本地缓存（内存+磁盘）：否则磁盘残留会在新进程回源时复活（真实场景验证暴露）。
     this.cache.deleteEntry(existing.id);
+    this.backlinks?.removeForward(existing.id); // 反链：清空该条目的出链（入边保留——悬空引用渲染容错）
     this.#auditWrite('remove', existing, write, {});
     return { entry: existing };
   }
@@ -449,6 +474,25 @@ class MemoryS3Service {
   }
 
   /**
+   * 反链查询（读路径，无审批）：返回引用了该条目 id 的条目列表（MODEL.md §6 L1——
+   * 写正向 links 时本地索引自动回填入边）。悬空目标（不存在于缓存）跳过——容错。
+   */
+  linkedTo(entryId) {
+    if (typeof entryId !== 'string' || entryId === '') {
+      throw domainError('INVALID_INPUT', 'linkedTo requires a non-empty entry id');
+    }
+    const sources = this.backlinks?.getBacklinks(entryId) ?? [];
+    const entries = [];
+    for (const id of sources) {
+      if (this.deleted.has(id)) continue;
+      const entry = this.cache.getEntry(id);
+      if (entry !== null) entries.push(entry);
+    }
+    entries.sort((a, b) => b.updatedAt - a.updatedAt);
+    return { entries, total: entries.length, stale: this.cache.isStale() };
+  }
+
+  /**
    * 语义召回（异步）：embed(query) → 向量 top-k（bruteForceTopK）→ 关键词子串
    * → RRF 合并（向量 w=1.0，关键词 w=0.7；TECH_STACK.md §6）。嵌入器不可用
    * 或全部无 embedding 时降级为纯关键词。
@@ -555,27 +599,52 @@ class MemoryS3Service {
 
   /**
    * 冻结快照渲染（systemPrompt 提供者专用：同步、无 await、只读内存缓存）。
-   * 投影 = 缓存条目中 importance ≥ threshold 的前 maxInjectedItems 条（排除
-   * forgotten/deleted）；无缓存返回 strings.notSynced 提示。
+   * 投影 = 分层注入（MODEL.md §8）：Bonds（locked 或 importance≥5 约定）恒前 →
+   * Moments（时刻按新近）→ Facts（知识按重要性，同分按图中心性/被引用数）。
+   * 排除 forgotten/deleted；无缓存返回 strings.notSynced 提示。
    */
   snapshotText() {
     const index = this.cache.getIndex();
     const all = this.#filterEntries({});
     const total = all.length;
     if (total === 0) return this.text.notSynced;
-    const eligible = all
-      .filter((e) => !this.forgotten.has(e.id))
-      .filter((e) => e.importance >= this.config.importanceThreshold)
-      .sort((a, b) => b.importance - a.importance || b.updatedAt - a.updatedAt)
-      .slice(0, this.config.maxInjectedItems);
+    const counts = this.backlinks?.allCounts() ?? new Map();
+    const visible = all.filter((e) => !this.forgotten.has(e.id));
+    const cap = this.config.maxInjectedItems;
+
+    // 分层三桶（仅收集 importance ≥ threshold 的注入候选；locked 无论如何入选——
+    // 约定类记忆是守护型，永不沉底）。
+    const bonds = visible
+      .filter((e) => e.locked === true || (e.type === 'preference' && e.importance >= 5))
+      .sort((a, b) => b.importance - a.importance || (counts.get(b.id) ?? 0) - (counts.get(a.id) ?? 0));
+    const moments = visible
+      .filter((e) => e.type === 'moment' && !bonds.includes(e))
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+    const facts = visible
+      .filter((e) => !bonds.includes(e) && !moments.includes(e) && e.importance >= this.config.importanceThreshold)
+      .sort((a, b) => b.importance - a.importance || (counts.get(b.id) ?? 0) - (counts.get(a.id) ?? 0));
+
+    // 按层填充预算：Bonds 保底（占 40% 或至少 1 条），余量给 Moments → Facts。
+    const bondCap = Math.max(1, Math.ceil(cap * 0.4));
+    const selected = [
+      ...bonds.slice(0, Math.min(bondCap, bonds.length)),
+      ...moments.slice(0, Math.max(0, cap - Math.min(bondCap, bonds.length))),
+    ];
+    const used = selected.length;
+    if (used < cap) selected.push(...facts.slice(0, cap - used));
+
     const lastSync = index?.lastSync ?? 'never';
-    const header = this.text.snapshotHeader({ count: eligible.length, total, lastSync });
-    const lines = eligible.map((e) => {
+    const header = this.text.snapshotHeader({ count: selected.length, total, lastSync });
+    const lines = selected.map((e) => {
       const att =
         Array.isArray(e.attachments) && e.attachments.length > 0
           ? ` 📎${e.attachments.map((a) => a.name).join(', ').slice(0, 48)}`
           : '';
-      return `- [${e.type}] ${e.title}: ${snippet(e.content)}${att}`;
+      const linkMark =
+        Array.isArray(e.links) && e.links.length > 0
+          ? ` →关联${e.links.length}`
+          : '';
+      return `- [${e.type}] ${e.title}: ${snippet(e.content)}${att}${linkMark}`;
     });
     return [header, ...lines].join('\n');
   }
@@ -617,13 +686,13 @@ class MemoryS3Service {
     return out;
   }
 
-  /** 同 (type, title) 去重预检（区分大小写，entry.mjs sameTitle 语义）。 */
+  /** 同 (type, title) 去重预检（区分大小写，entry.mjs sameTitle 语义）。locked 条目跳过——不可触碰。 */
   #findByTitle(type, title) {
     const ids = new Set([...this.cache.listDiskIds(), ...this.cache.listLocalIds()]);
     for (const id of ids) {
       if (this.deleted.has(id)) continue;
       const entry = this.cache.getEntry(id);
-      if (entry !== null && sameTitle(entry, { type, title })) return entry;
+      if (entry !== null && entry.locked !== true && sameTitle(entry, { type, title })) return entry;
     }
     return null;
   }
@@ -645,6 +714,12 @@ class MemoryS3Service {
       // 经测试断言暴露修正：新 key 按 next.type 计算 + 旧 key 删除）。
       ...(patch.type !== undefined ? { type: patch.type } : {}),
       ...(patch.importance !== undefined ? { importance: patch.importance } : {}),
+      // v2.1 模型字段：subject/timeline/links/locked 支持增量更新（links 替换语义）。
+      // subject/timeline 空串 = 清除（缺省不落盘契约：undefined 在 toJSON 时被省略）。
+      ...(patch.subject !== undefined ? { subject: patch.subject.trim() === '' ? undefined : patch.subject } : {}),
+      ...(patch.timeline !== undefined ? { timeline: patch.timeline.trim() === '' ? undefined : patch.timeline } : {}),
+      ...(patch.links !== undefined ? { links: sanitizeLinks(patch.links, existing.id) } : {}),
+      ...(patch.locked !== undefined ? { locked: patch.locked === true } : {}),
       updatedAt: Date.now(),
     };
     if (attachmentsToAdd.length > 0) {
@@ -656,8 +731,22 @@ class MemoryS3Service {
     await this.#askApproval({
       action: 'update',
       id: existing.id,
-      previous: { title: existing.title, content: existing.content },
-      next: { title: next.title, content: next.content },
+      previous: {
+        title: existing.title,
+        content: existing.content,
+        ...(existing.subject !== undefined ? { subject: existing.subject } : {}),
+        ...(existing.timeline !== undefined ? { timeline: existing.timeline } : {}),
+        ...(existing.links !== undefined ? { links: existing.links } : {}),
+        ...(existing.locked ? { locked: true } : {}),
+      },
+      next: {
+        title: next.title,
+        content: next.content,
+        ...(next.subject !== undefined ? { subject: next.subject } : {}),
+        ...(next.timeline !== undefined ? { timeline: next.timeline } : {}),
+        ...(Array.isArray(next.links) && next.links.length > 0 ? { links: next.links } : {}),
+        ...(next.locked ? { locked: true } : {}),
+      },
       type: next.type,
       tags: next.tags,
       importance: next.importance,
@@ -688,6 +777,7 @@ class MemoryS3Service {
       throw error;
     }
     this.cache.putEntry(next.id, next);
+    this.backlinks?.addForward(next.id, next.links); // 反链随链接改动自动刷新（替换语义）
     this.#auditWrite('update', next, write, { previousId: existing.id });
     return { previous: existing, entry: next };
   }
@@ -898,7 +988,7 @@ class MemoryS3Service {
           const match = /(?:^|\/)memories\/[^/]+\/([^/]+)\.json$/.exec(item.key);
           if (match === null) continue;
           const remote = await this.#readRemoteByType(type, match[1]);
-          if (remote !== null && sameTitle(remote, { type, title })) return remote;
+          if (remote !== null && remote.locked !== true && sameTitle(remote, { type, title })) return remote;
         }
         token = page.nextToken;
       } while (token !== undefined);
@@ -951,6 +1041,10 @@ const ENTRY_OUTPUT = {
     lastRecalled: { oneOf: [{ type: 'integer' }, { type: 'null' }], required: true },
     workspaceKey: { type: 'string', required: true },
     agentKey: { type: 'string', required: true },
+    subject: { type: 'string' },
+    timeline: { type: 'string' },
+    links: { type: 'array', items: { type: 'string' } },
+    locked: { type: 'boolean', required: true },
     attachments: {
       type: 'array',
       items: {
@@ -1047,7 +1141,7 @@ function makeMemoryTools(service) {
       name: 'memory_s3_save',
       description:
         'Save a structured memory entry to S3-backed cross-session memory (approval-gated). ' +
-        'type ∈ preference|project|decision|history. Deduplicates by (type, title): an existing entry with ' +
+        'type ∈ preference|project|decision|history|moment. Deduplicates by (type, title): an existing entry with ' +
         'the same type and title is merged via an update approval carrying both old and new text.',
       parameters: {
         type: { type: 'string', enum: TYPES, required: true, description: 'Entry type: preference|project|decision|history.' },
@@ -1057,6 +1151,10 @@ function makeMemoryTools(service) {
         importance: { type: 'integer', description: 'Importance 1-5 (default 3); >= threshold enters snapshot injection.' },
         workspaceKey: { type: 'string', description: 'Explicit workspace key; default = session cwd.' },
         agentKey: { type: 'string', description: 'Explicit agent key; default = session agentPreset.' },
+        subject: { type: 'string', description: 'Subject: who this memory is about — me | risu | us | world (or any string).' },
+        timeline: { type: 'string', description: 'Timeline anchor: worldline/period, e.g. α-2 | β | steins-gate | 2026-08.' },
+        links: { type: 'array', items: { type: 'string' }, description: 'Linked entry ids (reference-style links; backlinks auto-indexed locally).' },
+        locked: { type: 'boolean', description: 'Lock the entry (default false): locked entries skip same-title auto-merge; explicit writes still pass approval.' },
         attachments: {
           type: 'array',
           items: {
@@ -1127,6 +1225,32 @@ function makeMemoryTools(service) {
             importanceMin: args.importanceMin,
             limit: args.limit,
           });
+          return { ok: true, entries: result.entries, total: result.total, stale: result.stale };
+        } catch (error) {
+          return toolCatch(error);
+        }
+      },
+    }),
+
+    defineTool({
+      name: 'memory_s3_backlinks',
+      description:
+        'Backlink query (no approval; reads the local backlink index): returns entries whose links reference ' +
+        'the given entry id — "who points at this memory". Written links auto-populate this index (MODEL.md §6).',
+      parameters: {
+        id: { type: 'string', required: true, description: 'Entry id to find backlinks for.' },
+      },
+      output: {
+        schema: { type: 'object', additionalProperties: false, properties: QUERY_RESULT_PROPS },
+        render: (_args, value) =>
+          value.ok
+            ? renderText(`memory_s3_backlinks: ${value.total} backlink(s) → ${value.entries.map((e) => `[${e.type}] ${e.title}`).join(' | ') || '(none)'}`)
+            : renderText(`memory_s3_backlinks failed: ${value.error.code}: ${value.error.message}`),
+      },
+      execute: async (args, exec) => {
+        exec.signal.throwIfAborted();
+        try {
+          const result = service.linkedTo(args.id);
           return { ok: true, entries: result.entries, total: result.total, stale: result.stale };
         } catch (error) {
           return toolCatch(error);
@@ -1210,7 +1334,7 @@ function makeMemoryTools(service) {
       name: 'memory_s3_update',
       description:
         'Update one memory entry by id (approval-gated; the approval reason carries the full old and new text). ' +
-        'Supports title/content/tags/importance/type. Changing type migrates the S3 object key.',
+        'Supports title/content/tags/importance/type/subject/timeline/links/locked. Changing type migrates the S3 object key.',
       parameters: {
         id: { type: 'string', required: true, description: 'Entry id (from save/search/list results).' },
         title: { type: 'string', description: 'New title.' },
@@ -1218,6 +1342,10 @@ function makeMemoryTools(service) {
         type: { type: 'string', enum: TYPES, description: 'New type (migrates S3 key).' },
         tags: { type: 'array', items: { type: 'string' }, description: 'Replacement tags.' },
         importance: { type: 'integer', description: 'New importance 1-5.' },
+        subject: { type: 'string', description: 'New subject (empty string clears it).' },
+        timeline: { type: 'string', description: 'New timeline anchor (empty string clears it).' },
+        links: { type: 'array', items: { type: 'string' }, description: 'Replacement linked entry ids (references; backlinks auto-indexed).' },
+        locked: { type: 'boolean', description: 'New locked flag (true = skip same-title auto-merge).' },
       },
       output: {
         schema: {
@@ -1245,6 +1373,10 @@ function makeMemoryTools(service) {
               type: args.type,
               tags: args.tags,
               importance: args.importance,
+              subject: args.subject,
+              timeline: args.timeline,
+              links: args.links,
+              locked: args.locked,
             },
             writeContextOf(exec),
           );
@@ -1623,6 +1755,7 @@ export function apply(ctx, config = {}) {
   });
   const cache = createCache({ dir: cacheDir });
   const audit = createAudit({ dir: cacheDir, retentionDays: resolved.auditRetentionDays });
+  const backlinks = createBacklinks({ dir: cacheDir });
   const embedder = createEmbedder({
     provider: resolved.embedder.provider,
     endpoint: resolved.embedder.endpoint,
@@ -1634,6 +1767,7 @@ export function apply(ctx, config = {}) {
     s3,
     cache,
     audit,
+    backlinks,
     embedder,
     approval: ctx.approval,
     config: {
