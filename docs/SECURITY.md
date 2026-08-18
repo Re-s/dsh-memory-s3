@@ -39,7 +39,7 @@
 |---|---|
 | 访问密钥 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`（环境变量，进程内读取，不落盘） |
 | 会话令牌 | 支持临时凭据（STS）；不持久化 |
-| 区域/端点 | 区域与端点均经 settings.yaml Config 配置（region 默认 `us-east-1`、endpoint 默认 AWS） |
+| 区域/端点 | 配置经 **DSH 官方 `ctx.settings` 缝**三层解析（schema 默认 → entry config → 用户设置段 `settings.yaml` 顶层 `memory-s3:`）——region 默认 `us-east-1`、endpoint 默认 AWS；**凭据永远只从环境变量读取，绝不进配置文档/设置段** |
 | 配置文件 | 不读取 `~/.aws/credentials`（骨架阶段）；`dsh-credentials` 接入为后续版本 |
 | **硬规则** | 凭据绝不进入：条目字段、快照文本、审计 reason、会话日志、错误消息 |
 

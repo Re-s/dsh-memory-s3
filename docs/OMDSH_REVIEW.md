@@ -13,7 +13,7 @@
 | cordis.patch.yml | ✅ | `- insert: [{id: memory-s3, name: dsh-memory-s3}]` |
 | dshWorkshop.permissions | ⚠️ | `network:https` 与 `credentials:env` 为骨架声明，**出站网络枚举合法值待对照 OMDSH 规范核验** |
 | compatibility.dshVersions | ✅ | `["0.1.0-rc.6"]`（对齐 dsh-memento） |
-| 真实安装验证 | ✅ 预检通过（2026-08-18） | profile 为 **link 方式**（`node_modules/dsh-memory-s3 → ../../../../Documents/DSHWK/dsh-memory-s3`）——磁盘已是最新 v2.1 代码；加载预检通过（13 工具/服务方法/反链挂接/快照段）；真实 cordis 配置（dsh-mem/obj.seq.ink/prefix 空/auto/none）经 Config schema 编译通过。**完整激活待 DSH 重启**（重启会断开当前会话，由用户择时） |
+| 真实安装验证 | ✅ 预检通过（2026-08-18） | profile 为 **link 方式**（`node_modules/dsh-memory-s3 → ../../../../Documents/DSHWK/dsh-memory-s3`）——磁盘已是最新 v2.1 代码；加载预检通过（13 工具/服务方法/反链挂接/快照段）；真实 cordis 配置（dsh-mem/obj.seq.ink/prefix 空/auto/none）经 Config schema 编译通过。**完整激活待 DSH 重启**（重启会断开当前会话，由用户择时）。**配置通道注（0.1.1 起）**：非敏感配置现经 DSH 官方 `ctx.settings` 缝三层解析（schema 默认 → entry config base → 用户设置段 `settings.yaml` 顶层 `memory-s3:`）；此处记录的 cordis entry config 值即为 base 层，语义向后兼容 |
 
 ## 2. 功能完成度
 

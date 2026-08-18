@@ -90,7 +90,8 @@
 - 生命周期：仅对删除标记/旧版本设 Expiration 清理；**不转冷存储**（Glacier 等 40KB/对象固定开销对 1-2KB 记忆对象转冷反而亏钱）。
 
 ### D7. 凭据与网络面（明确披露，与 dsh-memento「零网络零凭据」哲学分岔）
-- S3 凭据：环境变量 `AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY/SESSION_TOKEN` 优先，其次 DSH 配置（骨架阶段仅环境变量；`dsh-credentials` 接入列为后续）。
+- S3 凭据：**仅环境变量** `AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY/SESSION_TOKEN`（`accessKeyEnv`/`secretKeyEnv` 可改名），进程内读取，绝不落盘；`dsh-credentials` 接入列为后续。
+- **非敏感配置（bucket/endpoint/region/prefix/writePolicy 等）经 DSH 官方 `ctx.settings` 缝三层解析**：schema 默认 → entry config（`cordis.patch.yml` base）→ 用户设置段（`settings.yaml` 顶层 `memory-s3:`，GUI 可编辑）——凭据与配置严格分离，配置文档永不承载凭据。
 - **凭据绝不进入条目字段/快照/审计**；秘密检测器（AK/SK 模式启发式）拒绝含凭据形状的写入。
 - 网络面：仅出站 HTTPS 到配置的 S3 endpoint + 嵌入端点。无其他出站。插件权限声明如实披露 network/subprocess 面。
 

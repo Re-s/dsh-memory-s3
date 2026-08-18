@@ -49,13 +49,19 @@ git clone https://github.com/Re-s/dsh-memory-s3.git
 npx @deepseek-ai/dsh plugin --profile web add "link:/path/to/dsh-memory-s3"
 ```
 
-配置环境变量（S3 凭据）：
+配置环境变量：
 
 ```bash
+# S3 凭据（必需；进程内读取，不落盘，绝不进配置文档）
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 export AWS_SESSION_TOKEN=...   # 可选，临时凭据
+
+# 向量召回嵌入（仅当 embedder.provider=openai-compatible 时用；provider=none 则不需要）
+export OPENAI_API_KEY=...      # 或按 embedder.apiKeyEnv 改名的变量
 ```
+
+> 凭据只走环境变量；**bucket / endpoint / region / prefix / writePolicy 等非敏感配置**经官方 `ctx.settings` 缝（见下）配置——配置与凭据严格分离。
 
 ### 配置（符合 DSH 官方设置缝 `ctx.settings`）
 
