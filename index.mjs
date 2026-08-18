@@ -1667,12 +1667,32 @@ function makeMemoryTools(service) {
  * 加载期校验（SECURITY.md §8）：bucket 非空、endpoint 协议、数值范围——非法响亮抛错。
  * 凭据缺失 → WARN + configured:false（插件仍加载，读走缓存/空）。
  */
-/**
- * DSH 官方设置缝（ctx.settings）的命名空间品牌。
- * 运行时 register 以字符串为 key，无需引入 @deepseek-ai/dsh-settings 的 TS 品牌函数；
- * 采用本地等价实现，避免为可选能力新增硬依赖。
- */
+/** 镜像 ctx.settings 官方类型（@deepseek-ai/dsh-settings）。
+    实际经 cordis 反射层可选获取，避免把 settings 声明进 inject（那样在未挂载
+    settings 的 profile 会导致插件挂起等待）。 */
 const SETTINGS_NS = 'memory-s3';
+
+/**
+ * 安全获取官方 ctx.settings 服务实例。
+ * - 优先走 cordis 反射层 `ctx.reflect.get(name, false)`——服务未挂载时返回
+ *   `undefined` 而非抛错（官方可选服务获取方式，见 cordis reflect._getImpl）;
+ * - 失败/异常一律返回 null，调用方据此降级。
+ * @param {object} ctx - 插件上下文。
+ * @returns {object|null} settings 服务，或 null（未挂载/不可达）。
+ */
+function tryGetSettings(ctx) {
+  try {
+    // 反射层可选获取：未提供 → undefined，不触发 "without inject"。
+    const viaReflect = ctx?.reflect?.get?.('settings', false);
+    if (viaReflect != null) return viaReflect;
+    // 兜底：某些宿主已把 settings 直接注入 ctx（有界访问，异常即降级）。
+    if (ctx && typeof ctx.settings === 'object' && ctx.settings !== null) return ctx.settings;
+    return null;
+  } catch {
+    // 任何访问异常（含 cordis "cannot get ... without inject"）都不可拖垮启动。
+    return null;
+  }
+}
 
 /**
  * 将 entry config 规整为「schema 默认强化」的 base 层，并（若官方 ctx.settings 缝已挂载）
@@ -1713,8 +1733,10 @@ function resolveRuntimeConfig(ctx, config = {}) {
       : DEFAULT_ALLOWED_EXTENSIONS,
   };
 
-  // 官方 ctx.settings 为可选服务：未挂载 provider 时必须无痕回退 entry config。
-  const register = ctx.settings?.register;
+  // 官方 ctx.settings 为可选服务：经反射层安全获取（未挂载 → null），绝不触发
+  // "cannot get property settings without inject"，也绝不让设置缝问题拖垮插件树。
+  const settings = tryGetSettings(ctx);
+  const register = settings?.register;
   if (typeof register !== 'function') return base;
 
   try {
@@ -1725,7 +1747,7 @@ function resolveRuntimeConfig(ctx, config = {}) {
     // 解析后的三层合并值（用户可经 GUI 设置页 / settings.yaml 覆盖 base）。
     return scope && typeof scope.get === 'function' ? scope.get() : base;
   } catch (error) {
-    // settings 不可用/校验失败绝不拖垮插件树：退回 entry config（符合官方容错语义）。
+    // settings 不可用/注册失败绝不拖垮插件树：退回 entry config（符合官方容错语义）。
     const message = error instanceof Error ? error.message : String(error);
     console.warn(`[memory-s3] settings registration skipped (${message}); using entry config`);
     return base;
