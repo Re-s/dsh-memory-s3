@@ -5,7 +5,7 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.1.1] - 2026-08-18
 
 ### Added
 
@@ -21,6 +21,12 @@
 ### Changed
 
 - 安装方式：支持从 GitHub 获取（`dsh plugin add https://github.com/Re-s/dsh-memory-s3.git`）；命令前缀兼容全局 `dsh` 与免安装 `npx @deepseek-ai/dsh`，本地 `link:` 方式保留为开发选项（README §安装）
+
+### Fixed（真实 DSH 会话复验暴露，2026-08-18）
+
+- **`memory_s3_forget` 反馈文案**：render 原用 `importance >= 0`（恒真）导致无论 `forgotten:true/false` 都显示 "injection suppressed"——改为读取调用参数，`forgotten:false` 正确回显 "restored"；render 断言（suppressed/restored/default 三态）补入测试
+
+## [Unreleased]
 
 ### 规划中（Initiation 完成）
 
