@@ -13,7 +13,7 @@
 | cordis.patch.yml | ✅ | `- insert: [{id: memory-s3, name: dsh-memory-s3}]` |
 | dshWorkshop.permissions | ⚠️ | `network:https` 与 `credentials:env` 为骨架声明，**出站网络枚举合法值待对照 OMDSH 规范核验** |
 | compatibility.dshVersions | ✅ | `["0.1.0-rc.6"]`（对齐 dsh-memento） |
-| 真实安装验证 | ⏳ 未做 | 需 `dsh plugin --profile web add "link:..."` + profile 重启；用户环境待办 |
+| 真实安装验证 | ✅ 预检通过（2026-08-18） | profile 为 **link 方式**（`node_modules/dsh-memory-s3 → ../../../../Documents/DSHWK/dsh-memory-s3`）——磁盘已是最新 v2.1 代码；加载预检通过（13 工具/服务方法/反链挂接/快照段）；真实 cordis 配置（dsh-mem/obj.seq.ink/prefix 空/auto/none）经 Config schema 编译通过。**完整激活待 DSH 重启**（重启会断开当前会话，由用户择时） |
 
 ## 2. 功能完成度
 
@@ -55,7 +55,7 @@
 - [ ] **代码注释滞后**：`index.mjs` 内 `memory_s3_save` 工具 description 文本仍写「type ∈ preference|project|decision|history」（参数 enum 已含 moment）——代码侧注释滞后，待测试子代理顺手修正（文档升级不修改 .mjs/.d.ts，如实披露）
 - [ ] **附件真实端点冒烟**：`scripts/smoke-attachments.mjs` 已就绪（7 步链路：probeFile → If-None-Match 创建 → CONFLICT → binary 往返 → sha256 → 条目元数据回读 → 清理），**待用户环境凭据（RUSTFS_AK/SK/BUCKET）执行**（单元/集成层已由 test/*.test.mjs 覆盖，缺的是真实端点验证）
 - [x] **SigV4 官方向量离线验证**：✅ 由真实端点验签替代（离线向量源受限，真实端点验证更具说服力）
-- [ ] **DSH 真实 profile 安装**：需 `dsh plugin add` + 重启
+- [x] **DSH 真实 profile 安装**：link 方式已确认 + 加载预检通过（2026-08-18）；激活待重启
 - [ ] 审批事件载荷结构核验（dsh-user-approval 未读）
 - [ ] dshWorkshop 出站网络枚举核验
 - [ ] Web 只读面板（client.js）——骨架阶段未做
