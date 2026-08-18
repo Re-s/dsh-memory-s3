@@ -17,9 +17,9 @@
     "index.mjs",
     "types.d.ts",
     "lib",
+    "docs",
     "cordis.patch.yml",
     "README.md",
-    "ARCHITECTURE.md",
     "CHANGELOG.md",
     "LICENSE"
   ],
