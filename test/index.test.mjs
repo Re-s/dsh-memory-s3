@@ -1075,6 +1075,14 @@ test('全部工具 render 回调可执行（success 与 error 两态），输出
     const saveTool = findTool(tools, 'memory_s3_save');
     const blocks = saveTool.output.render({}, { ok: true, action: 'created', entry: { ...entry, attachments: [attachment] } });
     assert.match(blocks[0].text, /id-1/);
+    // forget render 按 forgotten 参数区分 suppressed/restored（修复：此前恒显示 suppressed）。
+    const forgetTool = findTool(tools, 'memory_s3_forget');
+    const fgSuppress = forgetTool.output.render({ forgotten: true }, { ok: true, entry });
+    const fgRestore = forgetTool.output.render({ forgotten: false }, { ok: true, entry });
+    const fgDefault = forgetTool.output.render({}, { ok: true, entry });
+    assert.match(fgSuppress[0].text, /injection suppressed/, 'forgotten:true → suppressed');
+    assert.match(fgRestore[0].text, /injection restored/, 'forgotten:false → restored');
+    assert.match(fgDefault[0].text, /injection suppressed/, '缺省 → suppressed');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

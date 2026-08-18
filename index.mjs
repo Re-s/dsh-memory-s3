@@ -1300,9 +1300,11 @@ function makeMemoryTools(service) {
           additionalProperties: false,
           properties: { ...OK_ERROR_PROPS, entry: ENTRY_OUTPUT },
         },
-        render: (_args, value) =>
+        render: (args, value) =>
           value.ok
-            ? renderText(`memory_s3_forget: ${value.entry.id} injection ${value.entry.importance >= 0 ? 'suppressed' : ''}`)
+            ? renderText(
+                `memory_s3_forget: ${value.entry.id} injection ${args.forgotten === false ? 'restored' : 'suppressed'}`,
+              )
             : renderText(`memory_s3_forget failed: ${value.error.code}: ${value.error.message}`),
       },
       execute: async (args, exec) => {
