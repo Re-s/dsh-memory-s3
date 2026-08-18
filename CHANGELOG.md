@@ -9,6 +9,12 @@
 
 ### Added
 
+- **接入 DSH 官方 `ctx.settings` 设置缝**（feat，2026-08-19；对齐 @deepseek-ai/dsh-settings 契约）：
+  - 配置改为三层解析：schema 默认值 → 该插件条目配置（`cordis.patch.yml` 的 entry config，composition base 层）→ 用户设置段（`settings.yaml` 顶层 `memory-s3:`，GUI 设置页可编辑）
+  - 无 settings 服务的 profile 自动回退 entry config alone（官方契约：无 provider 时插件不受影响）；settings 注册失败绝不拖垮插件树（catch 回退 base）
+  - 命名空间 `memory-s3` 以 `applies:'restart'` 注册（S3/缓存构造较重，配置变更经重启生效）
+  - 新增可选依赖声明 `@deepseek-ai/dsh-settings`（optionalDependencies）
+
 - **记忆模型 v2.1 升级**（feat，2026-08-18；设计定稿 docs/MODEL.md）：
   - 类型新增 `moment`（共 5 类：preference/project/decision/history/moment，对应 Tulving 情景记忆——时刻/照片/纪念日）——存量四类型语义不动，moment 对旧数据零影响（兼容演进）
   - 条目新增可选四字段：`subject`（主体）/ `timeline`（时间线归属）/ `links`（关联引用）/ `locked`（锁定保护，默认 false 恒落盘，其余缺省不落盘）——validate/normalize/toJSON/fromJSON 全链路 + types.d.ts 契约落地（lib/entry.mjs）

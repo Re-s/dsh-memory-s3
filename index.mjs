@@ -11,6 +11,8 @@
 // - systemPrompt 提供者必须同步（rc.6 不 await）：text 回调内禁止 await，只读内存缓存。
 // - 不 append 未注册的会话事件类型（KNOWN_SESSION_EVENT_TYPES 门）：骨架干脆不 append。
 // - enabled:false 整体 return，不留半残。
+// - 配置文件三层解析（@deepseek-ai/dsh-settings 契约）：schema 默认 → entry config(base) →
+//   用户设置段。ctx.settings 为可选服务，未挂载/注册失败均无痕回退 entry config。
 // - 附件（照片/文件）能力：entries 元数据 + files/{id} 二进制对象（不可变、If-None-Match、
 //   sha256 校验）；本地读取经 lib/filemeta.mjs 白名单+魔法字节+大小三层防护；
 //   附件二进制不进审批 reason/审计（只进元数据摘要），文本类附件内容过秘密检测。
@@ -1665,8 +1667,25 @@ function makeMemoryTools(service) {
  * 加载期校验（SECURITY.md §8）：bucket 非空、endpoint 协议、数值范围——非法响亮抛错。
  * 凭据缺失 → WARN + configured:false（插件仍加载，读走缓存/空）。
  */
-export function apply(ctx, config = {}) {
-  const resolved = {
+/**
+ * DSH 官方设置缝（ctx.settings）的命名空间品牌。
+ * 运行时 register 以字符串为 key，无需引入 @deepseek-ai/dsh-settings 的 TS 品牌函数；
+ * 采用本地等价实现，避免为可选能力新增硬依赖。
+ */
+const SETTINGS_NS = 'memory-s3';
+
+/**
+ * 将 entry config 规整为「schema 默认强化」的 base 层，并（若官方 ctx.settings 缝已挂载）
+ * 注册命名空间做三层解析：schema 默认 → base（entry config 子集）→ 用户 section。
+ * 无 settings 服务时完全回退 base（entry config alone）——对齐 dsh-settings 契约
+ * 「Without a mounted provider nothing changes」。
+ * @param {object} ctx - 插件上下文（ctx.settings 为可选服务）。
+ * @param {object} config - 该插件 cordis 条目配置（entry config，= patch override 层）。
+ * @returns {object} 驱动本插件的最终 resolved 配置。
+ */
+function resolveRuntimeConfig(ctx, config = {}) {
+  // base = entry config（schema 默认强化）。这也是 settings 的 composition base 层。
+  const base = {
     enabled: config.enabled ?? true,
     bucket: config.bucket ?? '',
     prefix: config.prefix ?? 'dsh-memory-s3',
@@ -1693,6 +1712,28 @@ export function apply(ctx, config = {}) {
       ? config.allowedFileTypes
       : DEFAULT_ALLOWED_EXTENSIONS,
   };
+
+  // 官方 ctx.settings 为可选服务：未挂载 provider 时必须无痕回退 entry config。
+  const register = ctx.settings?.register;
+  if (typeof register !== 'function') return base;
+
+  try {
+    const scope = register(SETTINGS_NS, Config, {
+      base, // composition base 层 = entry config
+      applies: 'restart', // S3/缓存构造较重，配置变更经重启生效
+    });
+    // 解析后的三层合并值（用户可经 GUI 设置页 / settings.yaml 覆盖 base）。
+    return scope && typeof scope.get === 'function' ? scope.get() : base;
+  } catch (error) {
+    // settings 不可用/校验失败绝不拖垮插件树：退回 entry config（符合官方容错语义）。
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[memory-s3] settings registration skipped (${message}); using entry config`);
+    return base;
+  }
+}
+
+export function apply(ctx, config = {}) {
+  const resolved = resolveRuntimeConfig(ctx, config);
   if (resolved.enabled === false) return;
 
   if (typeof resolved.bucket !== 'string' || resolved.bucket === '') {

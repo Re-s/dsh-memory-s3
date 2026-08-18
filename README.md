@@ -57,33 +57,58 @@ export AWS_SECRET_ACCESS_KEY=...
 export AWS_SESSION_TOKEN=...   # 可选，临时凭据
 ```
 
-> bucket / prefix / endpoint / region 均在下方 settings.yaml 的 `plugins.memory-s3` 配置，不从环境变量读取。
+### 配置（符合 DSH 官方设置缝 `ctx.settings`）
 
-### 配置（$DSH_HOME/settings.yaml）
+> 本插件已接入 DSH 官方 `ctx.settings` 缝。配置经三层解析：
+> **schema 默认值 → 该插件条目配置（`cordis.patch.yml` 的 entry config，composition base）→ 用户设置段（`settings.yaml` 顶层 `memory-s3:`）**。
+> 未挂载 settings 服务的 profile 自动回退到 entry config alone（官方契约：无 provider 时插件不受影响）。
+>
+> S3 凭据只从环境变量读取（`accessKeyEnv`/`secretKeyEnv`，默认 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`），绝不落盘、绝不进设置文档。
+
+#### 方式一：官方设置缝（推荐，GUI 设置页可编辑）——`$DSH_HOME/settings.yaml`
+
+在 `settings.yaml` **顶层**写 `memory-s3:` 段（不是旧文档的 `plugins.memory-s3` 子段）：
 
 ```yaml
-plugins:
-  memory-s3:
+memory-s3:
+  enabled: true
+  bucket: my-memory-bucket
+  prefix: agent/memory
+  endpoint: ""          # 留空用 AWS；MinIO/R2 填 https://...
+  region: us-east-1
+  writePolicy: ask      # ask | auto | off
+  snapshotOrder: -50    # systemPrompt 注入段顺序
+  maxInjectedItems: 5   # 快照注入条数上限
+  importanceThreshold: 3 # 进入"事实层"注入候选的重要性下限
+  embedder:
+    provider: openai-compatible
+    endpoint: https://api.openai.com/v1/embeddings
+    apiKeyEnv: OPENAI_API_KEY
+    model: text-embedding-3-small
+    dimensions: 768    # 显式覆盖；text-embedding-3-small 常见 1536，此处代码默认 768
+  cacheDir: ""          # 留空 = $DSH_HOME/dsh-memory-s3/cache
+  auditRetentionDays: 0 # 0 = 永久保留
+  maxFileBytes: 20971520      # 附件大小上限（字节；默认 20MB，>100MB 时加载告警）
+  allowedFileTypes: [png, jpg, jpeg, gif, webp, pdf, zip, txt, md, json, csv]  # 附件扩展名白名单（小写，无点）
+```
+
+#### 方式二：entry config（composition base）
+
+在 profile 的 `cordis.patch.yml` 以小写 id 覆盖该条目的 `config`（整体替换语义）：
+
+```yaml
+- id: memory-s3
+  config:
     enabled: true
     bucket: my-memory-bucket
-    prefix: agent/memory
-    endpoint: ""          # 留空用 AWS；MinIO/R2 填 https://...
+    endpoint: ""
     region: us-east-1
-    writePolicy: ask      # ask | auto | off
-    snapshotOrder: -50    # systemPrompt 注入段顺序
-    maxInjectedItems: 5   # 快照注入条数上限
-    importanceThreshold: 3 # 进入"事实层"注入候选的重要性下限
+    writePolicy: ask
     embedder:
-      provider: openai-compatible
-      endpoint: https://api.openai.com/v1/embeddings
-      apiKeyEnv: OPENAI_API_KEY
-      model: text-embedding-3-small
-      dimensions: 768    # 显式覆盖；text-embedding-3-small 常见 1536，此处代码默认 768
-    cacheDir: ""          # 留空 = $DSH_HOME/dsh-memory-s3/cache
-    auditRetentionDays: 0 # 0 = 永久保留
-    maxFileBytes: 20971520      # 附件大小上限（字节；默认 20MB，>100MB 时加载告警）
-    allowedFileTypes: [png, jpg, jpeg, gif, webp, pdf, zip, txt, md, json, csv]  # 附件扩展名白名单（小写，无点）
+      provider: none
 ```
+
+用户设置段（方式一）中出现的字段会覆盖 entry config 的同名字段；entry config 又覆盖 schema 默认值。
 
 ### 使用
 
