@@ -6,7 +6,7 @@
 
 ## ✨ 特性
 
-- **S3 兼容存储后端**：条目 CRUD + manifest 清单 + 乐观并发（If-Match）；自定义 endpoint 兼容 MinIO/R2/OSS
+- **S3 兼容存储后端**：条目 CRUD + listObjects 同步 + 乐观并发（If-Match）；自定义 endpoint 兼容 MinIO/R2/OSS
 - **结构化记忆模型 v2.1**：`preference | project | decision | history | moment` 五类条目（moment = 时刻/照片/纪念日，对应 Tulving 情景记忆），带 importance/tags/source/时间戳 + 可选四维字段：`subject`（主体）/ `timeline`（时间线归属）/ `links`（关联引用）/ `locked`（锁定保护）
 - **向量语义检索**：可插拔嵌入器 + 余弦 top-k + 元数据/关键词混合召回（中文友好）
 - **本地缓存投影**：冻结快照只读本地缓存（rc.6 同步注入约束），S3 异步回源，离线降级只读
@@ -54,32 +54,31 @@ npx @deepseek-ai/dsh plugin --profile web add "link:/path/to/dsh-memory-s3"
 ```bash
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
-export AWS_REGION=us-east-1
-export MEMORY_S3_BUCKET=my-memory-bucket
-export MEMORY_S3_PREFIX=agent/memory   # 可选，默认 dsh-memory-s3
-export MEMORY_S3_ENDPOINT=...          # 可选，MinIO/R2 等自定义端点
+export AWS_SESSION_TOKEN=...   # 可选，临时凭据
 ```
+
+> bucket / prefix / endpoint / region 均在下方 settings.yaml 的 `plugins.memory-s3` 配置，不从环境变量读取。
 
 ### 配置（$DSH_HOME/settings.yaml）
 
 ```yaml
 plugins:
   memory-s3:
+    enabled: true
     bucket: my-memory-bucket
     prefix: agent/memory
     endpoint: ""          # 留空用 AWS；MinIO/R2 填 https://...
     region: us-east-1
     writePolicy: ask      # ask | auto | off
+    snapshotOrder: -50    # systemPrompt 注入段顺序
+    maxInjectedItems: 5   # 快照注入条数上限
+    importanceThreshold: 3 # 进入"事实层"注入候选的重要性下限
     embedder:
       provider: openai-compatible
       endpoint: https://api.openai.com/v1/embeddings
       apiKeyEnv: OPENAI_API_KEY
       model: text-embedding-3-small
-      dimensions: 1536
-    injection:
-      enabled: true
-      maxItems: 5
-      importanceThreshold: 3
+      dimensions: 768    # 显式覆盖；text-embedding-3-small 常见 1536，此处代码默认 768
     cacheDir: ""          # 留空 = $DSH_HOME/dsh-memory-s3/cache
     auditRetentionDays: 0 # 0 = 永久保留
     maxFileBytes: 20971520      # 附件大小上限（字节；默认 20MB，>100MB 时加载告警）
@@ -104,8 +103,8 @@ memory_s3_detach   移除附件（过审批门，删 S3 对象 + 条目元数据
 memory_s3_sync     手动同步 S3 增量
 memory_s3_status   状态视图
 
-# 命令行
-/memory-s3 status|sync
+# 命令行（规划中，未实现）
+# /memory-s3 status|sync
 ```
 
 ## 📁 项目结构
@@ -125,7 +124,7 @@ dsh-memory-s3/
 │   ├── gate.mjs       # 审批门策略封装
 │   ├── audit.mjs      # 审计账本（JSONL）
 │   └── strings.mjs    # 词表（en/zh）
-├── docs/              # requirements / TECH_STACK / ARCHITECTURE / SECURITY / OMDSH_REVIEW
+├── docs/              # requirements / TECH_STACK / ARCHITECTURE / SECURITY / MODEL / OMDSH_REVIEW / PROBLEM_REPORT.tests-v2.1
 ├── test/              # node --test
 ├── scripts/           # 冒烟脚本（smoke-rustfs.mjs / smoke-attachments.mjs）
 ├── cordis.patch.yml   # bundle 声明

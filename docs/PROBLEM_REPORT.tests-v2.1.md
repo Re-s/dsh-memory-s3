@@ -6,7 +6,7 @@
 ## 交付摘要
 
 - **测试总数：212**（entry 40 / backlinks 10 新增 / index 57；其余 105）
-- **覆盖率：行 97.64% / 分支 90.22% / 函数 94.44%**（全部达标）
+- **覆盖率：行 97.65% / 分支 90.26% / 函数 94.44%**（全部达标）
 - **改动文件（仅测试与测试内辅助）：**
   - `test/entry.test.mjs`（+147 行：v2.1 四字段 + moment 类型）
   - `test/index.test.mjs`（+355 行：四字段写入/更新、locked 跳过合并、反链工具、快照分层、反链持久化）
@@ -21,12 +21,16 @@
 - **影响**：S3 条目对象留脏键，与 MODEL.md §5「缺省不落盘」契约不完全一致；功能影响极小（读回无感），但快照/审批载荷中会出现空串字段。
 - **测试锁定方式**：按实现行为断言（`test/index.test.mjs`）：缓存态 `subject === ''`、磁盘 JSON 含空串、`fromJSON` 容错为 undefined、links 空数组则正确省略键。
 
+> ✅ **已解决（2026-08-18）**：`index.mjs` `#updateExisting` 已改为空串 → `undefined`（`patch.subject.trim() === '' ? undefined : patch.subject`，见 index.mjs:719-720），空字符串键不再落 S3，与 MODEL.md §5「缺省不落盘」契约一致。
+
 ## 观察 2（低优先级）· backlinks.json 载入容错不过滤空字符串来源 id
 
 - **位置**：`lib/backlinks.mjs` 构造时载入（`sources.filter((s) => typeof s === 'string')`）
 - **现象**：盘面形如 `{"B": ["A", ""]}` 时载入 `Set(['A', ''])`，`getBacklinks('B')` 返回 `['', 'A']`，并随下次 persist 回写；非字符串项（如数字）会被过滤，唯独空串穿透。
 - **影响**：部分损坏文件只做了半清洗；空串来源 id 在 `linkedTo` 查缓存必 miss，功能影响极小。
 - **测试锁定方式**：仅锁定被过滤的非字符串项（`test/backlinks.test.mjs` 载入容错用例），未固化空串缺陷本身。
+
+> ✅ **已解决（2026-08-18）**：`lib/backlinks.mjs` 载入路径已对来源 id 做 `trim` + `isValidLinkId` 过滤（见 lib/backlinks.mjs:55），空字符串来源 id 不再穿透、不再随下次 persist 回写。
 
 ## 观察 3（行为记录，非缺陷）· links 元素宽容 string 化
 

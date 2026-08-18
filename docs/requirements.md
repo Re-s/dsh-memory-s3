@@ -1,6 +1,6 @@
 # dsh-memory-s3（记忆S3）需求分析
 
-> 状态：Initiation（v0.1 draft）｜日期：2026-08-17（记忆模型 v2.1 增补 2026-08-18）
+> 状态：已发布 v0.1.1（2026-08-18，测试 212 全绿）｜日期：2026-08-17（记忆模型 v2.1 增补 2026-08-18）
 > 作者：Hououin Kyouma（未来道具研究所，Lab Member No.001）
 > 记忆模型 v2.1 设计定稿见 docs/MODEL.md。
 
@@ -67,7 +67,7 @@
 | # | 功能 | 说明 | 优先级 |
 |---|---|---|---|
 | F1 | S3 存储层 | bucket/prefix 配置、Get/Put/Delete/List/Head、自定义 endpoint（MinIO/R2/OSS） | P0 |
-| F2 | 条目模型 | type/title/content/tags/importance/source/embedding/timestamps/version + 可选 subject/timeline/links/locked（v2.1 四字段） | P0 |
+| F2 | 条目模型 | type/title/content/tags/importance/source/embedding/timestamps/recallCount/workspaceKey/agentKey + 可选 subject/timeline/links/locked（v2.1 四字段） + 可选 attachments | P0 |
 | F3 | CRUD 工具 | `memory_s3_save/search/recall/list/update/delete/forget` | P0 |
 | F4 | 审批门 | 写操作强制 `ctx.approval.request`（ask/auto/off 策略） | P0 |
 | F5 | 注入 | 会话冻结快照注入 systemPrompt（含预算头） | P0 |

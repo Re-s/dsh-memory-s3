@@ -31,11 +31,11 @@ npm run coverage      # 覆盖率报告（目标：行 ≥80% / 分支 ≥75% / 
 1. **`lib/` 零 DSH 依赖**：只依赖 node: 内置模块；任何 `@deepseek-ai/*` import 只允许出现在 `index.mjs`
 2. **审批门不可绕过**：写路径强制点位于 Service 写方法内部（`ctx.approval.request`），不在工具层；`writePolicy` 是 Config，模型不可见不可改
 3. **模型可见 ⟺ 落盘**：注入快照文本可自会话日志重建（request/header.system + 审计行 + 审批 reason）
-4. **失败要大声**：结构化错误码（领域码见 ARCHITECTURE.md D8：`INVALID_INPUT`/`NOT_FOUND`/`SECRET_DETECTED`/`DENIED`/`CONFLICT`/`FILE_NOT_FOUND`/`FILE_TOO_LARGE`/`UPLOAD_REJECTED`/`CORRUPT_FILE`；基础设施码 `S3_UNAVAILABLE`/`EMBED_FAILED`/`S3_ERROR`），绝不静默吞错
+4. **失败要大声**：结构化错误码（领域码见 ARCHITECTURE.md D8：`INVALID_INPUT`/`NOT_FOUND`/`SECRET_DETECTED`/`DENIED`/`CONFLICT`/`FILE_NOT_FOUND`/`FILE_TOO_LARGE`/`UPLOAD_REJECTED`/`CORRUPT_FILE`；配置码 `INVALID_CONFIG`；基础设施码 `S3_UNAVAILABLE`/`EMBED_FAILED`/`S3_ERROR`），绝不静默吞错
 5. **凭据纪律**：凭据绝不进入条目/快照/审计/日志；秘密检测器拒绝含凭据形状的写入
 6. **rc.6 会话事件门**：自定义事件 append 前必须过 `KNOWN_SESSION_EVENT_TYPES.has()`；不要取消该门
 7. **同步注入约束**：systemPrompt 提供者必须同步（rc.6 不 await）——快照只从本地缓存投影渲染，S3 异步回源
-8. 测试用合成数据，永不掺真实用户记忆；复用他人代码标注出处（THIRD_PARTY_NOTICES.md）
+8. 测试用合成数据，永不掺真实用户记忆；复用他人代码标注出处（`THIRD_PARTY_NOTICES.md`——待引入，当前无第三方代码复用，故该文件尚未创建）
 
 ## 行为变更
 

@@ -1,7 +1,7 @@
 # 记忆模型设计 · Memory Model v2.1（文献定稿版）
 
 > 状态：设计定稿（2026-08-18，经文献验证修订）｜作者：Hououin Kyouma（未来道具研究所，Lab Member No.001）
-> 决策来源：主人四道拍板（5 类型 / 三字段 / 照片挂 moment / 兼容演进）+ 三路文献侦察（认知科学 29 篇 Crossref 验证 / LLM 记忆系统 18 篇 / 关系图谱图谱方向）
+> 决策来源：主人四道拍板（5 类型 / 四字段 / 照片挂 moment / 兼容演进）+ 三路文献侦察（认知科学 29 篇 Crossref 验证 / LLM 记忆系统 18 篇 / 关系图谱图谱方向）
 > 本文档 v2.1 相对 v2 的修订：加入**文献依据**、定稿 **links 关系机制（L1）**、增加**记忆生命周期（提炼/整合）**、检索策略升级为**多信号混合**、明确 **L2 增强路线图**
 
 ---
@@ -70,7 +70,7 @@ LLM 记忆系统侧完全同构：CoALA 分类学（arXiv:2309.02427）的 worki
 ├─ 事件层 Moments ────────────────────────────────────────────┤
 │  "发生过什么"——照片、漂流瓶、纪念日、婚礼；会话摘要           │
 │  载体：moment（照片 1-N 附件）＋ history（摘要）              │
-├─ 事实层 Knowledge ──────────────────────────────────────────┤
+├─ 事实层 Facts ──────────────────────────────────────────────┤
 │  "我知道什么"——偏好、项目状态、决策记录                      │
 │  载体：preference / project / decision                      │
 └────────────────────────────────────────────────────────────┘
@@ -103,7 +103,7 @@ LLM 记忆系统侧完全同构：CoALA 分类学（arXiv:2309.02427）的 worki
 ### 5.3 `links: string[]` — 关联引用（L1 定稿，v2.1 新增）
 - 存法：目标条目 id 数组（**引用即链接**，Obsidian/Zettelkasten 心智）；写入时由调用方显式声明（A-MEM 方式，比后台图分析便宜）
 - **自动回填反链**：B 被 A 引用时，B 的 backlinks 计数自动 +1（A-MEM/双链笔记的"反链视图"）——不落盘 B 的字段，只维护本地反向索引（内存 Map + 持久化 JSON）
-- 渲染：A 显示 `→ 目标 title`；悬空引用（目标已删）显示 `(已删除)` 容错
+- 渲染：快照中带 links 条目行尾标记 `→关联N`（N = 出链数，见 §8 分层注入）；`memory_s3_backlinks` 查询以 `[type] title` 列出引用方。悬空引用（目标已删）的 `(已删除)` 展示标注为**规划中，未实现**
 - 校验：元素必须为合法 id 形状（uuid），杂数据拒写
 - 图中心性：被引用数是快照注入优先级的信号（L1 即可用：被引 ≥ 阈值的条目优先进快照）
 
@@ -174,7 +174,7 @@ export interface MemoryS3Entry {
 1. `lib/entry.mjs`：TYPES + 'moment'；subject/timeline/links/locked 四字段全链路（validate/normalize/toJSON/fromJSON）
 2. `lib/backlinks.mjs`（新）：本地反链索引（内存 Map + 持久化 JSON，写入时回填）
 3. `types.d.ts`：契约落地
-4. `index.mjs`：save 查重与远端预检跳过 locked；save/update 工具参数加四字段；反链维护挂钩；快照分层注入（Bonds 优先 + 被引用数）；ENRTY_OUTPUT 加字段
+4. `index.mjs`：save 查重与远端预检跳过 locked；save/update 工具参数加四字段；反链维护挂钩；快照分层注入（Bonds 优先 + 被引用数）；ENTRY_OUTPUT 加字段
 5. 测试：类型/字段/锁定合并/反链/快照分层
 6. 文档：ARCHITECTURE/CHANGELOG/README 同步
 

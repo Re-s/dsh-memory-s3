@@ -18,6 +18,11 @@
   - **快照分层注入**：冻结快照按 Bonds（locked / preference importance≥5，保底 40% 预算）→ Moments（moment 按新近）→ Facts（importance 降序、同分按被引用数/图中心性）三层投影；带 links 条目行尾自动标记 `→关联N`
   - `memory_s3_save` / `memory_s3_update` 工具参数新增 subject/timeline/links/locked（links 替换语义；更新时反链索引自动刷新）
 
+### Changed（docs，2026-08-18）
+
+- **OMDSH 安装验证记录**（commit 28dac24）：docs/OMDSH_REVIEW.md 补真实 link 安装预检通过结论
+- **README 环境变量代码围栏修复**（commit 23ccc2d）：补上未闭合的代码围栏，修复块格式化
+
 ### 规划中（Initiation 完成）
 
 - 需求分析定稿（docs/requirements.md）
@@ -45,8 +50,11 @@
 ### Fixed（真实 DSH 会话复验暴露，2026-08-18）
 
 - **`memory_s3_forget` 反馈文案**：render 原用 `importance >= 0`（恒真）导致无论 `forgotten:true/false` 都显示 "injection suppressed"——改为读取调用参数，`forgotten:false` 正确回显 "restored"；render 断言（suppressed/restored/default 三态）补入测试
+- **工具输出 schema 错误路径**（commit 4967b1c）：error-path 返回值补 `ok:false` 形状，满足 dsh-tools 输出校验
 
 ## [0.1.0] - 未发布
+
+> 未独立发布：0.1.0 内容随 0.1.1 一并发布（0.1.1 为首次正式 release）。
 
 ### Added
 

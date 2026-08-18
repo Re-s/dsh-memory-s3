@@ -15,7 +15,7 @@
 │   ├ ctx.tools        memory_s3_save/search/backlinks/recall/list/update/  │
 │   │                  delete/forget/attach/get_file/detach/sync/status      │
 │   ├ ctx.systemPrompt 冻结快照段（order=-50，同步提供者 + WeakMap 冻结）    │
-│   └ ctx.webServer    只读状态面板（骨架阶段：status 接口）                 │
+│   └ ctx.webServer    只读状态面板（规划中，未实现）                 │
 └──────────────┬───────────────────────────────────────────────────────────┘
                │ 写（带 exec.agent/callId/signal）  读（同步走缓存）
                ▼
@@ -24,7 +24,7 @@
 │  save() search() recall() list() update() remove() forget() sync()       │
 │  status() attach() detach() getFile() linkedTo()                         │
 │  写路径（审批门不可绕过）：                                                │
-│    嵌入(异步) ─▶ 预算/去重预检 ─▶ ctx.approval.request ─▶ 落盘 S3 ─▶ 审计  │
+│    嵌入(异步) ─▶ 去重预检     ─▶ ctx.approval.request ─▶ 落盘 S3 ─▶ 审计  │
 │    附件路径：本地探测(filemeta)─▶ 审批(元数据摘要)─▶ 上传 files/{id} ─▶ 条目│
 │  读路径：缓存优先（同步），缺失/过期时后台异步回源 S3                       │
 └──────────────┬───────────────────────────────────────────────────────────┘
@@ -54,7 +54,7 @@
 ### D1. S3 是唯一事实源，本地缓存是同步投影（由 rc.6 同步注入约束强制）
 - **平台约束**：rc.6 的 systemPrompt 提供者不被 await，必须同步返回（dsh-memento 决策 1 实证）。
 - **推论**：S3 是异步网络面，不可能在注入路径上同步读。因此冻结快照**只从本地缓存投影渲染**。
-- 缓存 = 上次同步的索引（manifest）+ 条目副本；启动时异步预热，会话事件驱动增量同步。
+- 缓存 = 上次同步的本地索引（cache 的 `index.json`：记录 lastSync/ok）+ 条目副本；启动时异步预热，会话事件驱动触发同步。
 - 无缓存首启时快照渲染为空 + 提示「记忆尚未同步」；`memory_s3_sync` 手动触发全量拉取。
 - 离线降级：检索走缓存视图，结果标注 `stale: true`；写入标记 `pending`（骨架阶段仅记录，不队列重放）。
 
@@ -77,10 +77,10 @@
 - 中文语义召回依赖嵌入模型质量；关键词子串作为无嵌入时的降级路径（嵌入器不可用时 `search` 仍可用）。
 
 ### D5. 审计三链（继承 dsh-memento 决策 5）
-- 写：`approval/asked`（reason 全文载荷）→ `approval/decided` → 本地 audit 账本行。
-- 被拒写：`*-denied` 审计行。
-- 召回/快照：audit(recalled)/audit(snapshot) 行（snapshot 行与注入文本逐字一致）。
-- **rc.6 会话事件约束**：不 append 未注册的 memory/* 事件类型（`KNOWN_SESSION_EVENT_TYPES` 门），与 dsh-memento 同策略。
+- 写成功落一条审计行，行名为动作名：`save` / `update` / `remove` / `forget` / `attach` / `detach` / `sync` / `recalled` / `file-retrieved` / `attachment-rollback` / `snapshot`（见 lib/audit.mjs append 调用点）。
+- 被拒 / 审批不可用（unavailable / rejected / cancelled）：落 `${action}-denied` 审计行（`outcome` 记录拒绝态），零落盘后抛 `DENIED`。
+- 快照：`audit('snapshot')` 行与注入文本逐字一致（模型可见 ⟺ 落盘，S2 不变量）。
+- **rc.6 会话注入约束**：本插件按 DSH 同步注入约束仅作系统提示段提供，不 append 自定义会话事件类型（session/event 面与本插件单链交叉点不延伸事件类型）——审计链在本插件内部为单账本简化，与 dsh-memento 的已知事件类型门同策略。
 
 ### D6. S3 对象布局：每记忆一对象 + 桶版本控制（详见 §3，实证自 S3 调研）
 - 条目对象 `memories/{kind}/{id}.json`：GET/PUT/DELETE 粒度最小、删除即生效、冲突面最小（不同 key 互不干扰）。
@@ -122,8 +122,6 @@ s3://<bucket>/<prefix>/
 │   ├── {kind}/
 │   │   └── <entry-id>.json      # 条目全文（含 embedding 数组 + 可选 attachments 元数据数组）
 │   │                            # kind = preference|project|decision|history|moment
-│   └── _meta/
-│       └── index.json           # 可选清单（仅"全量遍历"场景才建；骨架阶段不建）
 └── files/
     └── <attachmentId>           # 附件二进制（无扩展名；mime/name 在条目附件元数据）
 ```
@@ -214,7 +212,7 @@ index.mjs（唯一 DSH 依赖面：tools/systemPrompt/approval/on）
 ```
 memory_s3_save 工具（可选 attachments:[{path, note?}]）
   → 本地探测（lib/filemeta：扩展名白名单 + 魔数嗅探 + 大小上限；文本类内容过秘密检测）
-  → MemoryService.save（entry 校验 → 嵌入（异步）→ 去重预检）
+  → MemoryS3Service.save（entry 校验 → 嵌入（异步）→ 去重预检）
   → ctx.approval.request（reason 携带全文载荷 + 附件元数据摘要，二进制不进 reason）
   → outcome === allowed-once 才继续
   → 上传附件 files/{id}（PutObject + If-None-Match: *）→ S3Store.putEntry（If-Match/If-None-Match）
@@ -251,9 +249,15 @@ memory_s3_recall 工具
 ### 同步路径（sync）
 ```
 memory_s3_sync 工具 / 启动预热 / 会话事件驱动
-  → GetObject manifest（带 If-None-Match: 缓存 ETag）
-  → 变更则拉取增量条目 → 重建向量索引 → 更新缓存 + 审计
+  → s3store.listObjects 分页（prefix memories/ + continuationToken）拉全量远端 key
+  → 逐条 getObject → fromJSON 解析（单条损坏 warn + 跳过，账本可重建性优先）
+  → cache.putEntry 更新本地缓存 → 分页续拉直至 token 耗尽
+  → cache.setIndex({lastSync, ok:true}) + cache.setStale(false)
+  → audit('sync') 行 {pulled, outcome:'ok'} → 返回 {ok, pulled, updatedAt}
+失败 → cache 标 ok:false + setStale(true) + audit('sync' {outcome:'failed'})
+      → 返回 {ok:false}（离线降级读缓存仍可用）
 ```
+> 同步为**全量拉取**（listObjects 分页遍历 memories/ 前缀），不做 manifest/增量比对；每次 sync 重建缓存索引视图，由本地条目副本承担注入所需的只读投影。
 
 ### 反链数据流（v2.1：写 links → 本地反链索引 → linkedTo 查询）
 ```

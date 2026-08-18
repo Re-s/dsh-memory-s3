@@ -26,8 +26,8 @@
 | 威胁 | 描述 | 缓解 |
 |---|---|---|
 | **Spoofing**（凭据盗用） | 攻击者获得 S3 凭据 | 凭据仅环境变量/DSH 配置；最小权限 IAM；文档警示 |
-| **Tampering**（篡改条目） | 攻击者改桶内条目 | 依赖 S3 访问控制 + 服务端加密；manifest checksum 可检测（骨架阶段记录，不校验） |
-| **Repudiation**（否认写入） | 无法证明谁写了什么 | 审计三链：approval/asked+decided + 审计账本 + 快照（会话日志可重建） |
+| **Tampering**（篡改条目） | 攻击者改桶内条目 | 依赖 S3 访问控制 + 服务端加密；附件下载经 sha256 指纹比对防篡改（CORRUPT_FILE）；条目本身依赖 S3 完整性（不建清单，无独立主校验） |
+| **Repudiation**（否认写入） | 无法证明谁写了什么 | 审计三链：审批门（`approval.request` reason 带全文写载荷）+ 审计账本（save/update/... 与 `*-denied` 行）+ 快照（会话日志可重建） |
 | **Info Disclosure**（泄露） | 凭据/敏感内容写入记忆 | 秘密检测器（AK/SK/JWT/私钥模式启发式）拒绝写入（含文本类附件正文）；SSE 加密；本地缓存 0600；附件二进制不进审批/审计/session 日志（只进元数据摘要） |
 | **DoS**（拒绝服务） | 桶被清空/配额耗尽 | IAM 限制单 prefix；生命周期规则仅 archive/；文档警示共享风险 |
 | **Elevation**（提权） | 插件越权访问 | dshWorkshop.permissions 如实声明（network:https / credentials:env）；lib/ 零 DSH 依赖 |
@@ -39,19 +39,19 @@
 |---|---|
 | 访问密钥 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`（环境变量，进程内读取，不落盘） |
 | 会话令牌 | 支持临时凭据（STS）；不持久化 |
-| 区域/端点 | `AWS_REGION`；自定义 endpoint（MinIO/R2/OSS）经 Config 或 `MEMORY_S3_ENDPOINT` |
+| 区域/端点 | 区域与端点均经 settings.yaml Config 配置（region 默认 `us-east-1`、endpoint 默认 AWS） |
 | 配置文件 | 不读取 `~/.aws/credentials`（骨架阶段）；`dsh-credentials` 接入为后续版本 |
 | **硬规则** | 凭据绝不进入：条目字段、快照文本、审计 reason、会话日志、错误消息 |
 
 ## 3. 秘密检测器（写入时启发式扫描）
 
-对 `save/update/seed` 的 title/content/tags 全量扫描，命中即拒（`SECRET_DETECTED`）；**文本类附件（txt/md/json/csv）正文同样扫描**（探测阶段即执行，见 §6.2）：
+对 `save/update` 的 title/content/tags 全量扫描（`seed` 写入面规划中、当前未暴露工具），命中即拒（`SECRET_DETECTED`）；**文本类附件（txt/md/json/csv）正文同样扫描**（探测阶段即执行，见 §6.2）：
 
 - AWS AK：`AKIA[0-9A-Z]{16}`（及 `ASIA` 临时键）
 - 通用 Secret：`(secret|token|api[_-]?key|password)\s*[:=]\s*\S+`（上下文启发式）
 - JWT：`eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}`
 - PEM 私钥：`-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----`
-- 高熵串：长度 ≥ 32 的 base64/hex 高熵序列（骨架阶段可选，避免误伤）
+- 高熵串：长度 ≥ 32 的 base64/hex 高熵序列（**当前未实现**；`SECRET_PATTERNS` 实为 4 项：aws-access-key / jwt / pem-private-key / secret-assignment）
 
 > 说明：这是**启发式**扫描，不是确定性检测器。文档如实披露（继承 dsh-mnemon 的诚实披露哲学）。
 
@@ -144,8 +144,8 @@ mc admin policy attach local memory-s3-min --user memory-s3
 ## 7. 审计与重建（S2 不变量）
 
 - **模型可见 ⟺ 落盘**：注入快照逐字进入 `request/header.system`（会话日志）+ 审计账本 `audit(snapshot)` 行
-- 写：`approval/asked`（reason 全文载荷）→ `approval/decided` → 审计账本行
-- 被拒写：`*-denied` 审计行（turn 外 gate 路径的证据链）
+- 写成功：落一条审计活动行（`save`/`update`/`remove`/`forget`/`attach`/`detach`，reason 全文载荷经审批门 `approval.request` 携带）→ 审计账本行
+- 被拒写：`${action}-denied` 审计行（outcome 记录 rejected/cancelled/unavailable，turn 外 gate 路径的证据链）
 - 召回：`audit(recalled)` 行；`auditRetentionDays` 控制保留（默认 0 = 永久，文档警告）
 
 ## 8. 加载期与运行期校验
