@@ -158,6 +158,20 @@ test('listObjects 无截断时不返回 nextToken', async () => {
   }
 });
 
+test('listObjects 携带 continuation-token 分页续传', async () => {
+  const xml = '<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>dsh-memory-s3/memories/preference/b.json</Key></Contents></ListBucketResult>';
+  const m = mockFetch(() => jsonResponse(xml));
+  try {
+    const store = createS3Store(STORE_CONFIG);
+    const { keys } = await store.listObjects({ prefix: 'memories/', continuationToken: 'tok-abc' });
+    assert.equal(keys.length, 1);
+    const url = new URL(m.calls[0].url);
+    assert.equal(url.searchParams.get('continuation-token'), 'tok-abc');
+  } finally {
+    m.restore();
+  }
+});
+
 test('listObjects 对 404 容错为空列表（AWS/RustFS 行为差异兼容）', async () => {
   const m = mockFetch(() => new Response('', { status: 404 }));
   try {
@@ -259,6 +273,58 @@ test('keyOf 对齐 ARCHITECTURE.md §3 布局', () => {
   const store = createS3Store(STORE_CONFIG);
   assert.equal(store.keyOf('preference', 'abc'), 'memories/preference/abc.json');
   assert.equal(store.keyOf('history', 'xyz'), 'memories/history/xyz.json');
+});
+
+test('fileKeyOf：附件对象键为 files/{attachmentId}（无扩展名，与用户名解耦）', () => {
+  const store = createS3Store(STORE_CONFIG);
+  assert.equal(store.fileKeyOf('att-1'), 'files/att-1');
+  assert.equal(store.fileKeyOf('550e8400-e29b-41d4-a716-446655440000'), 'files/550e8400-e29b-41d4-a716-446655440000');
+});
+
+test('getObject binary 模式：body 为 Buffer 且逐字节无损（附件二进制往返）', async () => {
+  // 真实 PNG 魔数头 + 任意字节：模拟附件二进制对象。
+  const bytes = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x01, 0x02, 0x03, 0x04, 0x05, 0xfe, 0xff, 0x80, 0x7f,
+  ]);
+  const m = mockFetch(() => new Response(bytes, { status: 200, headers: { etag: '"bin-1"' } }));
+  try {
+    const store = createS3Store(STORE_CONFIG);
+    const obj = await store.getObject('files/att-1', { binary: true });
+    assert.ok(Buffer.isBuffer(obj.body), 'binary 模式 body 应为 Buffer');
+    assert.deepEqual(obj.body, Buffer.from(bytes), 'Buffer 内容与源字节逐字节一致（无 UTF-8 解码损坏）');
+    assert.equal(obj.etag, 'bin-1');
+    // GET 请求不带 body（方法校验）。
+    assert.equal(m.calls[0].init.method, 'GET');
+    assert.equal(m.calls[0].init.body, undefined);
+  } finally {
+    m.restore();
+  }
+});
+
+test('二进制往返：putObject 上传 Buffer → getObject binary 读回一致', async () => {
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x11, 0x22, 0xff, 0x00]);
+  let uploaded = null;
+  const m = mockFetch((record) => {
+    if (record.init.method === 'PUT') {
+      uploaded = Buffer.from(record.init.body);
+      return new Response('', { status: 200, headers: { etag: '"up-1"' } });
+    }
+    // GET：把刚上传的字节原样吐回。
+    return new Response(new Uint8Array(uploaded), { status: 200, headers: { etag: '"up-1"' } });
+  });
+  try {
+    const store = createS3Store(STORE_CONFIG);
+    await store.putObject('files/att-9', png, { contentType: 'image/png', ifNoneMatch: '*' });
+    const obj = await store.getObject('files/att-9', { binary: true });
+    assert.deepEqual(obj.body, png, 'PUT→GET 二进制往返无损');
+    // 上传请求 content-type 透传附件 mime。
+    assert.equal(m.calls[0].init.headers['content-type'], 'image/png');
+    assert.equal(m.calls[0].init.headers['if-none-match'], '*');
+  } finally {
+    m.restore();
+  }
 });
 
 test('prefix 为空时路径不出现空段（桶根模式）', async () => {

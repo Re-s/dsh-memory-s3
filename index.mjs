@@ -11,20 +11,39 @@
 // - systemPrompt 提供者必须同步（rc.6 不 await）：text 回调内禁止 await，只读内存缓存。
 // - 不 append 未注册的会话事件类型（KNOWN_SESSION_EVENT_TYPES 门）：骨架干脆不 append。
 // - enabled:false 整体 return，不留半残。
-//
-// 骨架阶段说明（如实披露）：
-// - cache.mjs 无 deleteEntry API，remove 用本地 deleted 集合屏蔽读路径（S3 侧对象已删，
-//   sync 后自然消失）。
-// - forget 仅本地标记（不删 S3 对象），快照投影排除 forgotten。
-// - 词表固定 en（Config 无 language 字段；strings('en')）。
+// - 附件（照片/文件）能力：entries 元数据 + files/{id} 二进制对象（不可变、If-None-Match、
+//   sha256 校验）；本地读取经 lib/filemeta.mjs 白名单+魔法字节+大小三层防护；
+//   附件二进制不进审批 reason/审计（只进元数据摘要），文本类附件内容过秘密检测。
+// - 函数调用日志（dev-preset quality_standards.function_tracing）：开发/验证阶段经
+//   DSH_MEMORY_S3_DEBUG 开启（trace 级 console.debug，JSON 结构化、敏感脱敏），
+//   生产默认关闭。
 
 import Schema from '@deepseek-ai/schemastery';
 import { defineTool } from '@deepseek-ai/dsh-tools';
+import { randomUUID, createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { createS3Store } from './lib/s3store.mjs';
 import { createEmbedder } from './lib/embedder.mjs';
-import { normalizeEntry, fromJSON, toJSON, sameTitle, detectEntrySecrets, TYPES } from './lib/entry.mjs';
+import {
+  normalizeEntry,
+  fromJSON,
+  toJSON,
+  sameTitle,
+  detectEntrySecrets,
+  detectSecret,
+  normalizeAttachment,
+  TYPES,
+} from './lib/entry.mjs';
+import {
+  probeFile,
+  formatBytes,
+  extensionOf,
+  DEFAULT_MAX_FILE_BYTES,
+  DEFAULT_ALLOWED_EXTENSIONS,
+  TEXT_EXTENSIONS,
+} from './lib/filemeta.mjs';
 import { bruteForceTopK } from './lib/vector.mjs';
 import { createCache } from './lib/cache.mjs';
 import { createAudit } from './lib/audit.mjs';
@@ -39,7 +58,17 @@ export const inject = ['tools', 'systemPrompt', 'approval'];
 const TOOL_PREFIX = 'memory_s3_';
 
 /** 领域错误码（工具层转为 {ok:false, error:{code,message}}；其余视为基础设施错误抛出）。 */
-const DOMAIN_CODES = new Set(['INVALID_INPUT', 'NOT_FOUND', 'SECRET_DETECTED', 'DENIED', 'CONFLICT']);
+const DOMAIN_CODES = new Set([
+  'INVALID_INPUT',
+  'NOT_FOUND',
+  'SECRET_DETECTED',
+  'DENIED',
+  'CONFLICT',
+  'FILE_NOT_FOUND',
+  'FILE_TOO_LARGE',
+  'UPLOAD_REJECTED',
+  'CORRUPT_FILE',
+]);
 
 /** 结构化领域错误：{code, message, details?}（对齐 ARCHITECTURE.md D8 错误码表）。 */
 function domainError(code, message, details) {
@@ -88,6 +117,8 @@ export const Config = Schema.object({
   }),
   cacheDir: Schema.string().default(''),
   auditRetentionDays: Schema.number().default(0),
+  maxFileBytes: Schema.number().default(DEFAULT_MAX_FILE_BYTES),
+  allowedFileTypes: Schema.array(Schema.string()).default(DEFAULT_ALLOWED_EXTENSIONS),
 });
 
 /**
@@ -113,6 +144,13 @@ class MemoryS3Service {
     this.forgotten = new Set();
     /** 本地删除屏蔽集合（cache 无 deleteEntry API 的骨架替代，见文件头注释）。 */
     this.deleted = new Set();
+    /** 附件上限与类型白名单（apply 层 resolved 传入；filemeta 默认兜底）。 */
+    this.maxFileBytes = Number.isFinite(deps.config.maxFileBytes) && deps.config.maxFileBytes > 0
+      ? deps.config.maxFileBytes
+      : DEFAULT_MAX_FILE_BYTES;
+    this.allowedFileTypes = Array.isArray(deps.config.allowedFileTypes) && deps.config.allowedFileTypes.length > 0
+      ? deps.config.allowedFileTypes
+      : DEFAULT_ALLOWED_EXTENSIONS;
   }
 
   // ── 写路径 ────────────────────────────────────────────────────────────────
@@ -121,39 +159,40 @@ class MemoryS3Service {
    * 新增条目（审批门 + 去重合并）。
    * 同 (type, title) 已存在 → merged（走 update 审批，载荷含新旧全文）；
    * 否则 created（If-None-Match: * 条件创建）。
+   * input.attachments = [{path, note}]：本地文件探测 → 审批后上传 files/{id} →
+   * 条目 attachments 元数据挂载。附件对象不可变（uuid 键 + If-None-Match + sha256）。
    */
   async save(input, write) {
     this.#assertAgent(write);
+    const t0 = Date.now();
     const workspaceKey = typeof input.workspaceKey === 'string' ? input.workspaceKey : this.#workspaceKeyOf(write);
     const agentKey = typeof input.agentKey === 'string' ? input.agentKey : this.#agentKeyOf(write);
-    const entry = normalizeEntry(input, { workspaceKey, agentKey });
-    this.#assertNoSecrets(entry);
 
+    // 1. 附件探测（本地读+三层校验；失败早失败，零 S3 副作用）。
+    const files = await this.#probeAttachments(input.attachments);
+    // 2. 构造条目（附件元数据挂入）。
+    const entry = normalizeEntry(
+      { ...input, ...(files.length > 0 ? { attachments: files.map((f) => f.meta) } : {}) },
+      { workspaceKey, agentKey },
+    );
+    this.#assertNoSecrets(entry);
+    this.#trace('save', { type: entry.type, title: entry.title, attachments: files.length, ms: Date.now() - t0 });
+
+    // 3. 去重合并且带附件 → 合并路径（附件在审批后统一上传）。
     const existing = this.#findByTitle(entry.type, entry.title);
     if (existing !== null) {
-      const { entry: merged } = await this.#updateExisting(existing, {
-        content: entry.content,
-        tags: entry.tags,
-        importance: entry.importance,
-      }, write);
-      return { action: 'merged', entry: merged };
+      return this.#mergeWithAttachments(existing, entry, files, write);
     }
-
     // 查重未命中但缓存可能未同步（清缓存/首次启动未预热）→ 远端预检同 type 前缀，
     // 防「S3 已有同 title 对象而本地缓存无」时创建重复条目（真实场景验证暴露）。
-    // 预检只列 key 不读 body，成本可控；命中同 title 则并入合并路径。
     if (this.cache.listDiskIds().length === 0) {
       const remoteSame = await this.#findRemoteByTitle(entry.type, entry.title);
       if (remoteSame !== null) {
-        const { entry: merged } = await this.#updateExisting(remoteSame, {
-          content: entry.content,
-          tags: entry.tags,
-          importance: entry.importance,
-        }, write);
-        return { action: 'merged', entry: merged };
+        return this.#mergeWithAttachments(remoteSame, entry, files, write);
       }
     }
 
+    // 4. created 路径：嵌入 → 审批（reason 含附件元数据摘要）→ 上传附件 → 落条目。
     await this.#tryEmbed(entry);
     await this.#askApproval({
       action: 'save',
@@ -165,11 +204,13 @@ class MemoryS3Service {
       source: entry.source,
       workspaceKey,
       agentKey,
+      ...(entry.attachments !== undefined ? { attachments: this.#attachmentSummary(entry.attachments) } : {}),
     }, write);
     this.#throwIfAborted(write);
 
     const key = this.s3.keyOf(entry.type, entry.id);
     try {
+      await this.#uploadAttachments(files);
       await this.s3.putObject(key, JSON.stringify(toJSON(entry)), { ifNoneMatch: '*' });
     } catch (error) {
       // 预检未发现但远端已存在（多实例并发/缓存过期）：读回远端条目。
@@ -178,18 +219,16 @@ class MemoryS3Service {
       if (error?.code === 'CONFLICT') {
         const remote = await this.#readRemoteByType(entry.type, entry.id);
         if (remote !== null && sameTitle(remote, entry)) {
-          const { entry: merged } = await this.#updateExisting(remote, {
-            content: entry.content,
-            tags: entry.tags,
-            importance: entry.importance,
-          }, write);
-          return { action: 'merged', entry: merged };
+          await this.#cleanupUploaded(files); // 合并路径会重传/重用：清理本次孤儿，避免重复对象
+          return this.#mergeWithAttachments(remote, entry, files, write);
         }
       }
+      await this.#cleanupUploaded(files); // 尽力回滚已上传附件（best-effort，S3 DELETE 幂等）
       throw error;
     }
     this.cache.putEntry(entry.id, entry);
-    this.#auditWrite('save', entry, write, {});
+    this.#auditWrite('save', entry, write, { attachments: entry.attachments?.length ?? 0 });
+    this.#trace('save:ok', { id: entry.id, ms: Date.now() - t0 });
     return { action: 'created', entry };
   }
 
@@ -243,6 +282,145 @@ class MemoryS3Service {
       outcome: 'ok',
     });
     return { entry };
+  }
+
+  // ── 附件路径（照片/文件，审批门同样不可绕过） ────────────────────────────
+
+  /**
+   * 给已有条目挂附件（审批门）。流程：探测本地文件（三层校验）→ 审批（reason 含附件
+   * 元数据）→ 上传 files/{id}（If-None-Match）→ 条目 attachments 追加（If-Match
+   * 乐观锁）→ 审计。失败尽力回滚已上传对象。
+   */
+  async attach(entryId, fileInput, write) {
+    this.#assertAgent(write);
+    const t0 = Date.now();
+    const existing = this.cache.getEntry(entryId);
+    if (existing === null) {
+      throw domainError('NOT_FOUND', `entry ${entryId} not found in cache; run memory_s3_sync first`);
+    }
+    const probed = await this.#probeAttachment(fileInput);
+    const attachment = probed.meta;
+    const next = {
+      ...existing,
+      attachments: [...(existing.attachments ?? []), attachment],
+      updatedAt: Date.now(),
+    };
+    this.#trace('attach', {
+      entryId,
+      name: attachment.name,
+      mime: attachment.mime,
+      size: attachment.size,
+      ms: Date.now() - t0,
+    });
+    await this.#askApproval({
+      action: 'attach',
+      id: existing.id,
+      type: existing.type,
+      title: existing.title,
+      attachment: this.#attachmentSummary([attachment])[0],
+    }, write);
+    this.#throwIfAborted(write);
+
+    try {
+      // 附件不可变对象：uuid key + If-None-Match（同 id 重复上传不可能；撞键即配置异常）。
+      await this.s3.putObject(attachment.objectKey, probed.bytes, {
+        contentType: attachment.mime,
+        ifNoneMatch: '*',
+      });
+      await this.#putEntryConditional(next);
+    } catch (error) {
+      await this.#cleanupUploaded([probed]);
+      throw error;
+    }
+    this.cache.putEntry(next.id, next);
+    this.#auditWrite('attach', next, write, {
+      attachmentId: attachment.id,
+      attachmentName: attachment.name,
+    });
+    this.#trace('attach:ok', { entryId, attachmentId: attachment.id, ms: Date.now() - t0 });
+    return { entry: next, attachment };
+  }
+
+  /**
+   * 移除附件（审批门）：删 files/{id} 对象 + 条目元数据移除（If-Match）。
+   * 文件对象删除成功才更新条目——二者保持引用一致（重试可恢复）。
+   */
+  async detach(entryId, attachmentId, write) {
+    this.#assertAgent(write);
+    const t0 = Date.now();
+    const existing = this.cache.getEntry(entryId);
+    if (existing === null) {
+      throw domainError('NOT_FOUND', `entry ${entryId} not found in cache; run memory_s3_sync first`);
+    }
+    const attachment = (existing.attachments ?? []).find((a) => a.id === attachmentId);
+    if (attachment === undefined) {
+      throw domainError('NOT_FOUND', `attachment ${attachmentId} not found on entry ${entryId}`);
+    }
+    const next = {
+      ...existing,
+      attachments: existing.attachments.filter((a) => a.id !== attachmentId),
+      updatedAt: Date.now(),
+    };
+    this.#trace('detach', { entryId, attachmentId, ms: Date.now() - t0 });
+    await this.#askApproval({
+      action: 'detach',
+      id: existing.id,
+      type: existing.type,
+      title: existing.title,
+      attachment: this.#attachmentSummary([attachment])[0],
+    }, write);
+    this.#throwIfAborted(write);
+
+    await this.s3.deleteObject(attachment.objectKey); // S3 DELETE 幂等；失败 → 抛，条目不更新（保持一致）
+    await this.#putEntryConditional(next, { requireRemote: true });
+    this.cache.putEntry(next.id, next);
+    this.#auditWrite('detach', next, write, {
+      attachmentId: attachment.id,
+      attachmentName: attachment.name,
+    });
+    this.#trace('detach:ok', { entryId, attachmentId, ms: Date.now() - t0 });
+    return { entry: next, attachment };
+  }
+
+  /**
+   * 下载附件到本地（读路径，无审批）：S3 拉取（binary）→ sha256 校验（防篡改/损坏）
+   * → 写入 <cacheDir>/files/<id>.<ext> → 返回本地路径与元数据。校验失败 → CORRUPT_FILE
+   * 拒绝落盘（损坏数据不落地，避免模型读到被投毒的文件）。
+   * 无 dir 参数时写入插件缓存目录（跨进程可见、可复用）。
+   */
+  async getFile(entryId, attachmentId, { dir } = {}) {
+    const t0 = Date.now();
+    const existing = this.cache.getEntry(entryId);
+    if (existing === null) {
+      throw domainError('NOT_FOUND', `entry ${entryId} not found in cache; run memory_s3_sync first`);
+    }
+    const attachment = (existing.attachments ?? []).find((a) => a.id === attachmentId);
+    if (attachment === undefined) {
+      throw domainError('NOT_FOUND', `attachment ${attachmentId} not found on entry ${entryId}`);
+    }
+    this.#trace('getFile', { entryId, attachmentId, ms: Date.now() - t0 });
+    const obj = await this.s3.getObject(attachment.objectKey, { binary: true });
+    if (obj === null) {
+      throw domainError('NOT_FOUND', `attachment object ${attachment.objectKey} missing on remote (entry metadata exists but file object does not)`);
+    }
+    const sha = createHash('sha256').update(obj.body).digest('hex');
+    if (sha !== attachment.sha256) {
+      throw domainError('CORRUPT_FILE', `attachment ${attachmentId} sha256 mismatch (expected ${attachment.sha256.slice(0, 12)}…, got ${sha.slice(0, 12)}…) — object corrupted or tampered`);
+    }
+    const targetDir = typeof dir === 'string' && dir !== '' ? dir : join(this.config.cacheDir, 'files');
+    await mkdir(targetDir, { recursive: true });
+    const ext = extensionOf(attachment.name);
+    const filePath = join(targetDir, `${attachment.id}${ext ? `.${ext}` : ''}`);
+    await writeFile(filePath, obj.body, { mode: 0o600 });
+    this.audit.append('file-retrieved', {
+      entryId,
+      attachmentId,
+      name: attachment.name,
+      size: attachment.size,
+      outcome: 'ok',
+    });
+    this.#trace('getFile:ok', { filePath, bytes: obj.body.length, ms: Date.now() - t0 });
+    return { attachment, path: filePath, size: obj.body.length };
   }
 
   // ── 读路径（同步走缓存） ─────────────────────────────────────────────────
@@ -392,7 +570,13 @@ class MemoryS3Service {
       .slice(0, this.config.maxInjectedItems);
     const lastSync = index?.lastSync ?? 'never';
     const header = this.text.snapshotHeader({ count: eligible.length, total, lastSync });
-    const lines = eligible.map((e) => `- [${e.type}] ${e.title}: ${snippet(e.content)}`);
+    const lines = eligible.map((e) => {
+      const att =
+        Array.isArray(e.attachments) && e.attachments.length > 0
+          ? ` 📎${e.attachments.map((a) => a.name).join(', ').slice(0, 48)}`
+          : '';
+      return `- [${e.type}] ${e.title}: ${snippet(e.content)}${att}`;
+    });
     return [header, ...lines].join('\n');
   }
 
@@ -444,16 +628,29 @@ class MemoryS3Service {
     return null;
   }
 
-  /** 合并更新实现（save 的 merged 路径与 update 共用）：秘密检测 → 嵌入 → 审批 → 条件写。 */
-  async #updateExisting(existing, patch, write) {
+  /**
+   * 合并更新实现（save 的 merged 路径与 update 共用）：秘密检测 → 嵌入 → 审批 → 条件写。
+   * 附件扩展： opts.attachmentsToAdd（已探测的元数据）→ 并入 next.attachments；
+   * opts.pendingUploads（{meta,bytes}[]）→ 审批后先上传附件再落条目（approve-what-you-see：
+   * 审批 reason 已含附件元数据摘要，二进制不进 reason）。
+   */
+  async #updateExisting(existing, patch, write, opts = {}) {
+    const { attachmentsToAdd = [], pendingUploads = [] } = opts;
     const next = {
       ...existing,
       ...(patch.title !== undefined ? { title: patch.title } : {}),
       ...(patch.content !== undefined ? { content: patch.content } : {}),
       ...(patch.tags !== undefined ? { tags: patch.tags } : {}),
+      // type 迁移：patch.type 必须应用到 next（此前遗漏——迁移分支会对旧 key 自覆盖后自删，
+      // 经测试断言暴露修正：新 key 按 next.type 计算 + 旧 key 删除）。
+      ...(patch.type !== undefined ? { type: patch.type } : {}),
       ...(patch.importance !== undefined ? { importance: patch.importance } : {}),
       updatedAt: Date.now(),
     };
+    if (attachmentsToAdd.length > 0) {
+      // 附件合并：追加（不覆盖既有附件——同 title 合并语义是"补充内容"而非"替换"）。
+      next.attachments = [...(existing.attachments ?? []), ...attachmentsToAdd];
+    }
     this.#assertNoSecrets(next);
     if (next.content !== existing.content || next.title !== existing.title) await this.#tryEmbed(next);
     await this.#askApproval({
@@ -464,26 +661,156 @@ class MemoryS3Service {
       type: next.type,
       tags: next.tags,
       importance: next.importance,
+      ...(attachmentsToAdd.length > 0
+        ? { attachmentsToAdd: this.#attachmentSummary(attachmentsToAdd) }
+        : {}),
     }, write);
     this.#throwIfAborted(write);
 
-    const key = this.s3.keyOf(next.type, next.id);
-    const keyChanged = patch.type !== undefined && patch.type !== existing.type;
-    if (keyChanged) {
-      // type 迁移：新 key 条件创建（If-None-Match），旧 key 删除。
-      await this.s3.putObject(key, JSON.stringify(toJSON(next)), { ifNoneMatch: '*' });
-      await this.s3.deleteObject(this.s3.keyOf(existing.type, existing.id));
-    } else {
-      const head = await this.s3.headObject(key);
-      if (head === null) {
-        throw domainError('NOT_FOUND', `entry ${next.id} not found on remote; run memory_s3_sync and retry`);
+    try {
+      if (pendingUploads.length > 0) await this.#uploadAttachments(pendingUploads);
+      const key = this.s3.keyOf(next.type, next.id);
+      const keyChanged = patch.type !== undefined && patch.type !== existing.type;
+      if (keyChanged) {
+        // type 迁移：新 key 条件创建（If-None-Match），旧 key 删除。
+        await this.s3.putObject(key, JSON.stringify(toJSON(next)), { ifNoneMatch: '*' });
+        await this.s3.deleteObject(this.s3.keyOf(existing.type, existing.id));
+      } else {
+        const head = await this.s3.headObject(key);
+        if (head === null) {
+          throw domainError('NOT_FOUND', `entry ${next.id} not found on remote; run memory_s3_sync and retry`);
+        }
+        // 乐观并发：If-Match 失败 → CONFLICT（工具层返回 ok:false，模型可重试）。
+        await this.s3.putObject(key, JSON.stringify(toJSON(next)), { ifMatch: head.etag });
       }
-      // 乐观并发：If-Match 失败 → CONFLICT（工具层返回 ok:false，模型可重试）。
-      await this.s3.putObject(key, JSON.stringify(toJSON(next)), { ifMatch: head.etag });
+    } catch (error) {
+      await this.#cleanupUploaded(pendingUploads); // 尽力回滚本次已上传附件（勿伤已有引用）
+      throw error;
     }
     this.cache.putEntry(next.id, next);
     this.#auditWrite('update', next, write, { previousId: existing.id });
     return { previous: existing, entry: next };
+  }
+
+  /** save 合并路径的统一入口：带附件 → 走 #updateExisting 附件扩展；不带 → 原样合并。 */
+  async #mergeWithAttachments(existing, entry, files, write) {
+    const patch = {
+      content: entry.content,
+      tags: entry.tags,
+      importance: entry.importance,
+    };
+    if (files.length === 0) {
+      const { entry: merged } = await this.#updateExisting(existing, patch, write);
+      return { action: 'merged', entry: merged };
+    }
+    // 去重合并：新探测的附件作为 addition 合并；旧附件保留。
+    const existingIds = new Set((existing.attachments ?? []).map((a) => a.id));
+    const additions = files.filter((f) => !existingIds.has(f.meta.id));
+    const { entry: merged } = await this.#updateExisting(existing, patch, write, {
+      attachmentsToAdd: additions.map((f) => f.meta),
+      pendingUploads: additions,
+    });
+    return { action: 'merged', entry: merged };
+  }
+
+  // ── 附件辅助 ──────────────────────────────────────────────────────────────
+
+  /** 探测多附件（save 的 attachments 数组；空/缺失 → []）。单个失败整体失败（早失败）。 */
+  async #probeAttachments(attachments) {
+    if (attachments === undefined || attachments === null) return [];
+    if (!Array.isArray(attachments)) {
+      throw domainError('INVALID_INPUT', 'attachments must be an array of {path, note?}');
+    }
+    const out = [];
+    for (const item of attachments) {
+      out.push(await this.#probeAttachment(item));
+    }
+    return out;
+  }
+
+  /**
+   * 探测单附件：lib/filemeta 三层校验（白名单/魔法字节/大小）+ 文本类内容秘密检测 →
+   * 构造不可变元数据（uuid id、files/{id} key、sha256）。零网络副作用。
+   */
+  async #probeAttachment(input) {
+    if (input === null || typeof input !== 'object' || typeof input.path !== 'string' || input.path === '') {
+      throw domainError('INVALID_INPUT', 'attachment requires a non-empty path');
+    }
+    const probed = await probeFile(input.path, {
+      maxBytes: this.maxFileBytes,
+      allowedExtensions: this.allowedFileTypes,
+    });
+    // 文本类附件内容过秘密检测（二进制跳过——无法文本扫描，安全披露见 docs/SECURITY.md）。
+    if (TEXT_EXTENSIONS.has(probed.extension)) {
+      const hit = detectSecret(probed.bytes.toString('utf8'));
+      if (hit !== null) {
+        throw domainError('SECRET_DETECTED', `attachment "${probed.name}" content contains secret-like content (${hit.pattern})`);
+      }
+    }
+    const id = randomUUID();
+    const meta = normalizeAttachment({
+      id,
+      name: probed.name,
+      mime: probed.mime,
+      kind: probed.kind,
+      size: probed.size,
+      sha256: probed.sha256,
+      objectKey: this.s3.fileKeyOf(id),
+      ...(typeof input.note === 'string' && input.note !== '' ? { note: input.note } : {}),
+    });
+    return { meta, bytes: probed.bytes };
+  }
+
+  /** 上传附件对象（If-None-Match 条件创建；撞键 = 配置异常，抛 CONFLICT）。 */
+  async #uploadAttachments(files) {
+    for (const f of files) {
+      await this.s3.putObject(f.meta.objectKey, f.bytes, {
+        contentType: f.meta.mime,
+        ifNoneMatch: '*',
+      });
+    }
+  }
+
+  /** 尽力回滚已上传附件（S3 DELETE 幂等；失败静默——孤儿对象无害且审计可查）。 */
+  async #cleanupUploaded(files) {
+    for (const f of files) {
+      try {
+        await this.s3.deleteObject(f.meta.objectKey);
+        this.audit.append('attachment-rollback', { objectKey: f.meta.objectKey, outcome: 'ok' });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.audit.append('attachment-rollback', { objectKey: f.meta.objectKey, outcome: 'failed', error: message });
+      }
+    }
+  }
+
+  /** 条目条件写（If-Match 乐观锁；远端缺失时报错而非覆盖）。attach/detach 共用。 */
+  async #putEntryConditional(entry, { requireRemote = true } = {}) {
+    const key = this.s3.keyOf(entry.type, entry.id);
+    const head = await this.s3.headObject(key);
+    if (head === null) {
+      if (!requireRemote) return; // 创建性写入不要求远端已存在
+      throw domainError('NOT_FOUND', `entry ${entry.id} not found on remote; run memory_s3_sync and retry`);
+    }
+    await this.s3.putObject(key, JSON.stringify(toJSON(entry)), { ifMatch: head.etag });
+  }
+
+  /** 附件元数据摘要（审批 reason / 审计用；不含二进制，仅身份信息）。 */
+  #attachmentSummary(attachments) {
+    return attachments.map((a) => ({
+      id: a.id,
+      name: a.name,
+      mime: a.mime,
+      kind: a.kind,
+      size: a.size,
+      sha256: a.sha256.slice(0, 12),
+    }));
+  }
+
+  /** 函数调用日志（dev-preset function_tracing，trace 级）：DSH_MEMORY_S3_DEBUG 门控，JSON 结构化。 */
+  #trace(fn, fields) {
+    if (!process.env.DSH_MEMORY_S3_DEBUG) return;
+    console.debug(`[memory-s3:${fn}]`, JSON.stringify({ fn, ...fields }));
   }
 
   /** 审批门（approve-what-you-see）：唯一放行 allowed-once；其余落 *-denied 审计行后抛 DENIED。 */
@@ -624,12 +951,47 @@ const ENTRY_OUTPUT = {
     lastRecalled: { oneOf: [{ type: 'integer' }, { type: 'null' }], required: true },
     workspaceKey: { type: 'string', required: true },
     agentKey: { type: 'string', required: true },
+    attachments: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          id: { type: 'string', required: true },
+          name: { type: 'string', required: true },
+          mime: { type: 'string', required: true },
+          kind: { type: 'string', required: true },
+          size: { type: 'integer', required: true },
+          sha256: { type: 'string', required: true },
+          objectKey: { type: 'string', required: true },
+          note: { type: 'string' },
+          createdAt: { type: 'integer', required: true },
+        },
+      },
+    },
   },
 };
 
 const ENTRY_LIST_OUTPUT = {
   type: 'array',
   items: ENTRY_OUTPUT,
+};
+
+/** 附件元数据输出投影（attach/get_file/detach 的 attachment 字段；字段集对齐 types.d.ts）。 */
+const ENTRY_ATTACHMENT_OUTPUT = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    id: { type: 'string', required: true },
+    name: { type: 'string', required: true },
+    mime: { type: 'string', required: true },
+    kind: { type: 'string', required: true },
+    size: { type: 'integer', required: true },
+    sha256: { type: 'string', required: true },
+    objectKey: { type: 'string', required: true },
+    note: { type: 'string' },
+    createdAt: { type: 'integer', required: true },
+  },
 };
 
 const ERROR_OUTPUT = {
@@ -695,6 +1057,18 @@ function makeMemoryTools(service) {
         importance: { type: 'integer', description: 'Importance 1-5 (default 3); >= threshold enters snapshot injection.' },
         workspaceKey: { type: 'string', description: 'Explicit workspace key; default = session cwd.' },
         agentKey: { type: 'string', description: 'Explicit agent key; default = session agentPreset.' },
+        attachments: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              path: { type: 'string', required: true, description: 'Local file path to attach (PNG/JPG/GIF/WebP/PDF/ZIP/TXT/MD/JSON/CSV).' },
+              note: { type: 'string', description: 'Optional note/description for the attachment.' },
+            },
+          },
+          description: 'Optional local photo/file attachments. Validated (magic bytes + extension + size limit), uploaded to S3 as immutable objects; binary is never included in approval reasons (metadata+sha256 only).',
+        },
       },
       output: {
         schema: {
@@ -943,6 +1317,117 @@ function makeMemoryTools(service) {
     }),
 
     defineTool({
+      name: 'memory_s3_attach',
+      description:
+        'Attach a local photo/file to an existing memory entry (approval-gated). ' +
+        'The file is validated (magic bytes + extension whitelist + size limit <=20MB), uploaded to S3 as an ' +
+        'immutable object, and its metadata (name/mime/size/sha256) is appended to the entry. ' +
+        'Attachments are listed in search/list results; download with memory_s3_get_file.',
+      parameters: {
+        id: { type: 'string', required: true, description: 'Entry id from save/search/list results.' },
+        path: { type: 'string', required: true, description: 'Local file path (PNG/JPG/GIF/WebP/PDF/ZIP/TXT/MD/JSON/CSV).' },
+        note: { type: 'string', description: 'Optional note/description for the attachment.' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            ...OK_ERROR_PROPS,
+            entry: ENTRY_OUTPUT,
+            attachment: ENTRY_ATTACHMENT_OUTPUT,
+          },
+        },
+        render: (_args, value) =>
+          value.ok
+            ? renderText(`memory_s3_attach: +${value.attachment.name} (${value.attachment.kind}, ${formatBytes(value.attachment.size)}) → ${value.entry.id}`)
+            : renderText(`memory_s3_attach failed: ${value.error.code}: ${value.error.message}`),
+      },
+      execute: async (args, exec) => {
+        exec.signal.throwIfAborted();
+        try {
+          const result = await service.attach(args.id, { path: args.path, note: args.note }, writeContextOf(exec));
+          return { ok: true, entry: result.entry, attachment: result.attachment };
+        } catch (error) {
+          return toolCatch(error);
+        }
+      },
+    }),
+
+    defineTool({
+      name: 'memory_s3_get_file',
+      description:
+        'Download an attached photo/file to a local path (no approval; read path). ' +
+        'Verifies the object sha256 against the entry metadata (rejects corrupted/tampered files), ' +
+        'writes to the plugin cache dir (or dir=...) and returns the absolute path for the model to use.',
+      parameters: {
+        id: { type: 'string', required: true, description: 'Entry id.' },
+        attachmentId: { type: 'string', required: true, description: 'Attachment id (from entry.attachments).' },
+        dir: { type: 'string', description: 'Optional destination directory; default = plugin cache files dir.' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            ...OK_ERROR_PROPS,
+            path: { type: 'string' },
+            size: { type: 'integer' },
+            attachment: ENTRY_ATTACHMENT_OUTPUT,
+          },
+        },
+        render: (_args, value) =>
+          value.ok
+            ? renderText(`memory_s3_get_file: ${value.attachment.name} (${formatBytes(value.size)}) → ${value.path}`)
+            : renderText(`memory_s3_get_file failed: ${value.error.code}: ${value.error.message}`),
+      },
+      execute: async (args, exec) => {
+        exec.signal.throwIfAborted();
+        try {
+          const result = await service.getFile(args.id, args.attachmentId, { dir: args.dir });
+          return { ok: true, path: result.path, size: result.size, attachment: result.attachment };
+        } catch (error) {
+          return toolCatch(error);
+        }
+      },
+    }),
+
+    defineTool({
+      name: 'memory_s3_detach',
+      description:
+        'Remove an attachment from an entry (approval-gated): deletes the S3 file object and strips its ' +
+        'metadata from the entry (If-Match optimistic lock). The entry itself is kept.',
+      parameters: {
+        id: { type: 'string', required: true, description: 'Entry id.' },
+        attachmentId: { type: 'string', required: true, description: 'Attachment id (from entry.attachments).' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            ...OK_ERROR_PROPS,
+            entry: ENTRY_OUTPUT,
+            attachment: ENTRY_ATTACHMENT_OUTPUT,
+          },
+        },
+        render: (_args, value) =>
+          value.ok
+            ? renderText(`memory_s3_detach: -${value.attachment.name} from ${value.entry.id} (${value.entry.attachments?.length ?? 0} attachment(s) left)`)
+            : renderText(`memory_s3_detach failed: ${value.error.code}: ${value.error.message}`),
+      },
+      execute: async (args, exec) => {
+        exec.signal.throwIfAborted();
+        try {
+          const result = await service.detach(args.id, args.attachmentId, writeContextOf(exec));
+          return { ok: true, entry: result.entry, attachment: result.attachment };
+        } catch (error) {
+          return toolCatch(error);
+        }
+      },
+    }),
+
+    defineTool({
       name: 'memory_s3_sync',
       description:
         'Pull remote S3 objects into the local cache index and rebuild the in-memory vector index. ' +
@@ -1043,7 +1528,7 @@ function makeMemoryTools(service) {
 
 /**
  * 插件挂载。enabled:false → 整体 return（工具/服务/注入/审批 answerer 全部消失）。
- * 加载期校验（SECURITY.md §7）：bucket 非空、endpoint 协议、数值范围——非法响亮抛错。
+ * 加载期校验（SECURITY.md §8）：bucket 非空、endpoint 协议、数值范围——非法响亮抛错。
  * 凭据缺失 → WARN + configured:false（插件仍加载，读走缓存/空）。
  */
 export function apply(ctx, config = {}) {
@@ -1069,6 +1554,10 @@ export function apply(ctx, config = {}) {
     },
     cacheDir: config.cacheDir ?? '',
     auditRetentionDays: config.auditRetentionDays ?? 0,
+    maxFileBytes: config.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES,
+    allowedFileTypes: Array.isArray(config.allowedFileTypes) && config.allowedFileTypes.length > 0
+      ? config.allowedFileTypes
+      : DEFAULT_ALLOWED_EXTENSIONS,
   };
   if (resolved.enabled === false) return;
 
@@ -1087,6 +1576,15 @@ export function apply(ctx, config = {}) {
   }
   if (!Number.isInteger(resolved.auditRetentionDays) || resolved.auditRetentionDays < 0) {
     throw invalidConfig('auditRetentionDays must be a non-negative integer');
+  }
+  if (!Number.isFinite(resolved.maxFileBytes) || resolved.maxFileBytes <= 0) {
+    throw invalidConfig('maxFileBytes must be a positive number');
+  }
+  if (resolved.maxFileBytes > 100 * 1024 * 1024) {
+    console.warn('[memory-s3] maxFileBytes > 100MB — large attachments may exceed S3/network limits; keep objects small for reliable sync');
+  }
+  if (resolved.allowedFileTypes.some((t) => typeof t !== 'string' || t === '')) {
+    throw invalidConfig('allowedFileTypes must be an array of non-empty strings');
   }
   if (resolved.endpoint !== '') {
     if (!/^https?:\/\//.test(resolved.endpoint)) {
@@ -1142,6 +1640,8 @@ export function apply(ctx, config = {}) {
       maxInjectedItems: resolved.maxInjectedItems,
       cacheDir,
       configured,
+      maxFileBytes: resolved.maxFileBytes,
+      allowedFileTypes: resolved.allowedFileTypes,
     },
   });
 

@@ -36,8 +36,9 @@
 4. 本地缓存与离线降级：LRU 条目缓存 + 清单缓存；离线只读
 5. 写入治理：DSH approval seam 审批门（service 内部强制点）+ 审计
 6. 上下文注入：会话级冻结快照（跨会话记忆进入 systemPrompt）
-7. 模型工具面：save/search/recall/list/update/delete/forget/sync/status
-8. 会话摘要归档：会话结束自动提炼 → 待审提案（骨架阶段可选）
+7. 模型工具面：save/search/recall/list/update/delete/forget/attach/get_file/detach/sync/status（12 工具）
+8. 照片/文件附件：图片/PDF/压缩包/文本可挂载入条目，检索/快照可见元数据；本地文件三重校验（白名单/魔数/大小）
+9. 会话摘要归档：会话结束自动提炼 → 待审提案（骨架阶段可选）
 
 ### 非目标（Out of scope，v0.1）
 - 多租户/多用户隔离（单 prefix 单信任域）
@@ -75,6 +76,7 @@
 | F9 | 同步 | `memory_s3_sync` 手动/定时拉取远端变更（增量） | P1 |
 | F10 | 会话摘要 | 会话结束 → LLM 提炼 → 待审提案 | P2 |
 | F11 | 状态面板 | `memory_s3_status` + Web 只读面板 | P2 |
+| F12 | 照片/文件附件 | `save` 携附件 / `memory_s3_attach` / `memory_s3_get_file` / `memory_s3_detach`；二进制存 `files/{id}` 不可变对象，条目只存元数据；扩展名白名单 + 魔法字节 + 大小上限三重校验 | P1 |
 
 ## 5. 约束条件（Constraints）
 

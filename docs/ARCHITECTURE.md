@@ -1,6 +1,6 @@
 # dsh-memory-s3（记忆S3）架构设计
 
-> 状态：Initiation（v0.1 draft）｜日期：2026-08-17
+> 状态：Initiation（v0.1 draft）｜日期：2026-08-17（附件能力增补 2026-08-18）
 > 本文档描述模块边界、数据流、S3 对象布局、同步投影机制与安全模型。技术选型结论见 TECH_STACK.md。
 
 ---
@@ -13,7 +13,7 @@
 │                                                                          │
 │  Consumer 面：                                                            │
 │   ├ ctx.tools        memory_s3_save/search/recall/list/update/delete/    │
-│   │                  forget/sync/status                                   │
+│   │                  forget/attach/get_file/detach/sync/status            │
 │   ├ ctx.systemPrompt 冻结快照段（order=-50，同步提供者 + WeakMap 冻结）    │
 │   └ ctx.webServer    只读状态面板（骨架阶段：status 接口）                 │
 └──────────────┬───────────────────────────────────────────────────────────┘
@@ -22,9 +22,10 @@
 ┌────────────────────────────────────────────────────────────────────────┐
 │ Service Definition：ctx.memoryS3（index.mjs）                            │
 │  save() search() recall() list() update() remove() forget() sync()       │
-│  status()                                                                 │
+│  status() attach() detach() getFile()                                    │
 │  写路径（审批门不可绕过）：                                                │
 │    嵌入(异步) ─▶ 预算/去重预检 ─▶ ctx.approval.request ─▶ 落盘 S3 ─▶ 审计  │
+│    附件路径：本地探测(filemeta)─▶ 审批(元数据摘要)─▶ 上传 files/{id} ─▶ 条目│
 │  读路径：缓存优先（同步），缺失/过期时后台异步回源 S3                       │
 └──────────────┬───────────────────────────────────────────────────────────┘
                │
@@ -34,7 +35,8 @@
 │  cache.mjs      本地缓存：索引 JSON + 条目 LRU（内存/磁盘）                │
 │  embedder.mjs   嵌入接口 + OpenAI 兼容实现（fetch）                       │
 │  vector.mjs     余弦相似度 top-k + 元数据过滤（纯 JS）                    │
-│  entry.mjs      条目模型校验/规范化/序列化                                │
+│  entry.mjs      条目模型校验/规范化/序列化（含附件元数据）                 │
+│  filemeta.mjs   附件探测：白名单/魔数嗅探/大小上限/sha256（纯 node）       │
 │  gate.mjs       审批门策略封装（reason 编解码）                           │
 │  audit.mjs      审计账本（JSONL 追加，本地）                              │
 │  strings.mjs    模型可见/命令面词表（en/zh）                              │
@@ -56,9 +58,9 @@
 - 离线降级：检索走缓存视图，结果标注 `stale: true`；写入标记 `pending`（骨架阶段仅记录，不队列重放）。
 
 ### D2. 审批门做在 Service 写方法内部（继承 dsh-memento 决策 2，Hermes #48181 教训）
-- 任何路径调 `ctx.memoryS3.save/update/remove/seed` 必然经过 `ctx.approval.request`。
+- 任何路径调 `ctx.memoryS3.save/update/remove/attach/detach` 必然经过 `ctx.approval.request`（附件挂/摘同属写操作，审批门不可绕过）。
 - `writePolicy`（ask/auto/off，默认 ask）是 Config，模型不可见不可改；会话级 `approval/never` 由审批服务硬拦截，插件不可绕过。
-- **approve-what-you-see**：审批 reason 携带完整写载荷——save/update 含新旧全文，remove 含被删全文。
+- **approve-what-you-see**：审批 reason 携带完整写载荷——save/update 含新旧全文，remove 含被删全文；附件写操作携带**附件元数据摘要**（id/name/mime/kind/size/sha256 前缀），**二进制内容不进 reason**。
 - **被拒写留痕**：`rejected/cancelled/unavailable` 落 `*-denied` 审计行后抛结构化错误，零落盘。
 
 ### D3. 快照注入走 systemPrompt 段（order=-50），模型可见 ⟺ 落盘
@@ -91,19 +93,45 @@
 - 网络面：仅出站 HTTPS 到配置的 S3 endpoint + 嵌入端点。无其他出站。插件权限声明如实披露 network/subprocess 面。
 
 ### D8. 错误处理与降级
-- 结构化错误码：`S3_UNAVAILABLE` / `CONFLICT`（If-Match 失败）/ `EMBED_FAILED` / `BUDGET_EXCEEDED` / `INVALID_INPUT` / `DENIED`。
+- **领域错误码**（DOMAIN_CODES，工具层转为 `{ok:false, error:{code,message}}`；对齐 index.mjs DOMAIN_CODES）：
+  `INVALID_INPUT` / `NOT_FOUND` / `SECRET_DETECTED`（秘密检测命中，含附件文本内容）/ `DENIED`（审批拒绝或不可用）/ `CONFLICT`（If-Match/If-None-Match 失败）/ `FILE_NOT_FOUND`（附件本地路径不存在）/ `FILE_TOO_LARGE`（附件超 maxFileBytes）/ `UPLOAD_REJECTED`（扩展名/魔数白名单拒绝）/ `CORRUPT_FILE`（附件下载 sha256 不符）
+- **基础设施错误**（非 ok:false 路径，原样抛出）：`S3_UNAVAILABLE`（网络/5xx，retryable，指数退避 ≤3 次）/ `EMBED_FAILED`（嵌入失败，仅日志降级不阻塞写入）/ `S3_ERROR`（其余 4xx，配置错误响亮失败）
 - 可重试错误（网络抖动/5xx）指数退避最多 3 次；仍失败 → 写标记 pending（骨架阶段仅日志），读走缓存降级并标注 stale。
-- 加载期校验：bucket/prefix/endpoint 非法配置响亮失败（schemastery schema 层双保险）。
+- 加载期校验：bucket/prefix/endpoint 非法配置响亮失败（schemastery schema 层双保险）；`maxFileBytes` 非正数 / `allowedFileTypes` 空串成员同样响亮失败（SECURITY.md §8）。
 
 ## 3. S3 对象布局（实证自 S3 调研子代理）
 
 ```
 s3://<bucket>/<prefix>/
-└── memories/
-    ├── {kind}/
-    │   └── <entry-id>.json      # 条目全文（含 embedding 数组）；kind = preference|project|decision|history
-    └── _meta/
-        └── index.json           # 可选清单（仅"全量遍历"场景才建；骨架阶段不建）
+├── memories/
+│   ├── {kind}/
+│   │   └── <entry-id>.json      # 条目全文（含 embedding 数组 + 可选 attachments 元数据数组）
+│   │                            # kind = preference|project|decision|history
+│   └── _meta/
+│       └── index.json           # 可选清单（仅"全量遍历"场景才建；骨架阶段不建）
+└── files/
+    └── <attachmentId>           # 附件二进制（无扩展名；mime/name 在条目附件元数据）
+```
+
+**附件对象（files/ 面，v0.1 新增）**：
+- **不可变**：`attachmentId` = uuid（`randomUUID`），创建走 `PutObject + If-None-Match: *`（撞键返回 412/409 → `CONFLICT`，同 id 重复上传不可能）；写入后不修改，更新语义由 detach + attach 组合表达。
+- **与文件名解耦**：对象键不含用户文件名（文件名仅存元数据 `name`）→ 防路径注入、防后缀伪装；下载时从 `name` 推导扩展名（`extensionOf`），本地文件名为 `<id>.<ext>`。
+- **完整性**：探测时计算 sha256 存入元数据；`getFile` 下载后重算比对，不一致 → `CORRUPT_FILE` 拒绝落盘（损坏数据不落地）。
+- **脚本/可执行载荷拒绝**：白名单制（11 种扩展名），SVG 故意不在白名单（XML 可含脚本载荷，XSS 披露，见 SECURITY.md）；本地探测经 `lib/filemeta.mjs` 三层校验（扩展名白名单 + 魔法字节嗅探 + 大小上限）。
+
+**条目附件元数据形状**（= `MemoryS3Attachment`，见 types.d.ts；结构挂条目 JSON 的 `attachments` 数组）：
+```json
+{
+  "id": "uuid",
+  "name": "photo.png",
+  "mime": "image/png",
+  "kind": "image",
+  "size": 4096,
+  "sha256": "64-hex-digest",
+  "objectKey": "files/<uuid>",
+  "note": "可选说明",
+  "createdAt": 1789000000000
+}
 ```
 
 **条目对象形状**（= `MemoryS3Entry` 的 JSON 序列化，见 types.d.ts）：
@@ -122,14 +150,20 @@ s3://<bucket>/<prefix>/
   "lastRecalled": null,
   "embedding": [0.0023, -0.011],
   "workspaceKey": "",
-  "agentKey": ""
+  "agentKey": "",
+  "attachments": [
+    { "id": "uuid", "name": "photo.png", "mime": "image/png", "kind": "image",
+      "size": 4096, "sha256": "64-hex-digest", "objectKey": "files/<uuid>",
+      "createdAt": 1789000000000 }
+  ]
 }
 ```
 
 **并发写协议**（条件写，无锁数据库语义）：
 1. **创建**：PutObject with `If-None-Match: *`；412/409（已存在）→ 读回合并或重试
 2. **更新**：HeadObject 取 ETag → PutObject with `If-Match: <etag>`；412（被并发修改）→ 重读-合并-指数退避（≤3 次）
-3. **删除**：DeleteObject（versioning 下产生删除标记，可恢复）
+3. **附件对象**：PutObject with `If-None-Match: *`（不可变创建）；删除走 DeleteObject（幂等，versioning 下可恢复）
+4. **删除**：DeleteObject（versioning 下产生删除标记，可恢复）
 
 **一致性**：AWS/R2/OSS 均强读后写（无需读重试补偿）；自建 MinIO 需 xfs/zfs（ext4/NFS 不保证）——文档明示。
 
@@ -144,6 +178,7 @@ index.mjs（唯一 DSH 依赖面：tools/systemPrompt/approval/on）
   ├── lib/embedder.mjs   ← fetch（可插拔）
   ├── lib/vector.mjs     ← 纯函数
   ├── lib/entry.mjs      ← 纯函数
+  ├── lib/filemeta.mjs   ← node:fs + node:crypto（附件探测）
   ├── lib/gate.mjs       ← 纯函数
   ├── lib/audit.mjs      ← node:fs（JSONL 追加）
   └── lib/strings.mjs    ← 纯函数
@@ -155,13 +190,33 @@ index.mjs（唯一 DSH 依赖面：tools/systemPrompt/approval/on）
 
 ### 写路径（save）
 ```
-memory_s3_save 工具
+memory_s3_save 工具（可选 attachments:[{path, note?}]）
+  → 本地探测（lib/filemeta：扩展名白名单 + 魔数嗅探 + 大小上限；文本类内容过秘密检测）
   → MemoryService.save（entry 校验 → 嵌入（异步）→ 去重预检）
-  → ctx.approval.request（reason 携带全文载荷）
+  → ctx.approval.request（reason 携带全文载荷 + 附件元数据摘要，二进制不进 reason）
   → outcome === allowed-once 才继续
-  → S3Store.putEntry（If-Match/If-None-Match）+ manifest 更新
-  → 本地缓存更新 + audit 行
-  → 下一会话首 assemble：冻结快照从缓存渲染注入 systemPrompt 段
+  → 上传附件 files/{id}（PutObject + If-None-Match: *）→ S3Store.putEntry（If-Match/If-None-Match）
+  → 本地缓存更新 + audit 行（含 attachment-rollback 回滚留痕）
+  → 下一会话首 assemble：冻结快照从缓存渲染注入 systemPrompt 段（附件条目行尾 📎文件名列表，48 字符截断）
+```
+
+### 附件写路径（attach / save 合并路径的附件追加）
+```
+memory_s3_attach 工具
+  → 本地探测（同上三层校验 + 文本秘密检测）→ 构造不可变元数据（uuid id、files/{id} key、sha256）
+  → ctx.approval.request（reason 含附件元数据摘要）
+  → PUT files/{id}（If-None-Match: *）→ 条目附件元数据追加（If-Match 乐观锁）→ 缓存 + 审计
+  → 任一步失败 → 尽力回滚已上传对象（DELETE 幂等）+ attachment-rollback 审计
+```
+
+### 附件下载路径（get_file）
+```
+memory_s3_get_file 工具
+  → 条目缓存命中 → 附件元数据存在性校验（无 → NOT_FOUND）
+  → GET files/{id}（binary 读取）→ 对象缺失 → NOT_FOUND
+  → 重算 sha256 与元数据比对（不符 → CORRUPT_FILE，拒绝落盘）
+  → 写入 <cacheDir>/files/<id>.<ext>（或 dir=...；文件权限 0600）
+  → audit(file-retrieved) 行 → 返回本地路径与元数据
 ```
 
 ### 读路径（recall/search）
@@ -183,9 +238,10 @@ memory_s3_sync 工具 / 启动预热 / 会话事件驱动
 | 面 | 措施 |
 |---|---|
 | 传输 | HTTPS 强制（S3 endpoint 与嵌入端点均为 https://） |
-| 静态 | 依赖 S3 服务端加密（SSE-S3 默认，可配 SSE-KMS）；本地缓存文件权限 0600 |
-| 凭据 | 仅环境变量/DSH 配置；不进条目/快照/审计；秘密检测器拒绝写入 |
-| 权限 | 最小权限 IAM/桶策略：仅单 prefix 读写（TECH_STACK.md 附 policy 示例） |
+| 静态 | 依赖 S3 服务端加密（SSE-S3 默认，可配 SSE-KMS）；本地缓存文件权限 0600（含下载附件） |
+| 凭据 | 仅环境变量/DSH 配置；不进条目/快照/审计；秘密检测器拒绝写入（含文本类附件内容） |
+| 附件 | 白名单制（11 种扩展名 + 魔数嗅探一致，SVG 拒绝）；大小上限 20MB（maxFileBytes 可配）；附件二进制不进审批 reason 与审计（只进元数据摘要）；下载 sha256 校验防篡改；文件名与对象键解耦（防路径注入/后缀伪装） |
+| 权限 | 最小权限 IAM/桶策略：仅单 prefix 读写（memories/* + files/*，TECH_STACK.md 附 policy 示例） |
 | 治理 | 审批门不可绕过；审计三链可重建；卸载不删云上数据（文档明示） |
 | 信任域 | 单 bucket+prefix 单信任域；共享 = 共享数据（README 安全边界明示） |
 

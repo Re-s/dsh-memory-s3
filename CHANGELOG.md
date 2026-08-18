@@ -7,6 +7,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- **照片/文件附件能力**（feat）：`memory_s3_save` 新增 `attachments: [{path, note?}]` 参数；新增 `memory_s3_attach` / `memory_s3_get_file` / `memory_s3_detach` 三工具（工具总数 9 → 12）
+- **附件对象布局 `files/{attachmentId}`**：二进制存 S3 不可变对象（uuid 键 + `If-None-Match: *` 创建 + sha256 元数据校验），条目 JSON 只存附件元数据数组 `attachments`（id/name/mime/kind/size/sha256/objectKey/note/createdAt）
+- **本地文件三重校验**（新模块 `lib/filemeta.mjs`）：扩展名白名单 + 魔法字节嗅探（扩展名先验与魔数一致，不一致即拒）+ 大小上限；文本类（txt/md/json/csv）内容过秘密检测（SECRET_DETECTED）；SVG 不在白名单（XSS 披露）
+- **新配置**：`maxFileBytes`（默认 20MB，>100MB 加载告警）/ `allowedFileTypes`（默认 png/jpg/jpeg/gif/webp/pdf/zip/txt/md/json/csv）
+- **附件安全面**：附件二进制不进审批 reason 与审计（只进元数据摘要）；下载走 sha256 校验（不符 → CORRUPT_FILE 拒绝落盘）；`get_file` 文件权限 0600；审计新增 `attachment-rollback` / `file-retrieved` 行
+- **快照注入增强**：带附件条目行尾追加 `📎文件名列表`（48 字符截断）
+- **函数调用日志**：`DSH_MEMORY_S3_DEBUG` 门控 trace 级 JSON 结构化日志（dev-preset function_tracing，生产默认关闭）
+- **真实端点冒烟脚本**：`scripts/smoke-attachments.mjs`（附件链路 7 步：探测 → If-None-Match 创建 → CONFLICT → binary 往返 → sha256 → 条目元数据回读 → 清理；凭据走 `RUSTFS_*` 环境变量，待用户环境执行）
+
 ### Changed
 
 - 安装方式：支持从 GitHub 获取（`dsh plugin add https://github.com/Re-s/dsh-memory-s3.git`）；命令前缀兼容全局 `dsh` 与免安装 `npx @deepseek-ai/dsh`，本地 `link:` 方式保留为开发选项（README §安装）

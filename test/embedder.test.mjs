@@ -157,3 +157,78 @@ test('响应缺少 data[0].embedding → EMBED_FAILED', async () => {
 test('未知 provider → INVALID_CONFIG', () => {
   assert.throws(() => createEmbedder({ provider: 'watson' }), (err) => err.code === 'INVALID_CONFIG');
 });
+
+test('openai-compatible / ollama：endpoint 缺失 → INVALID_CONFIG', () => {
+  assert.throws(() => createEmbedder({ provider: 'openai-compatible' }), (err) => err.code === 'INVALID_CONFIG');
+  assert.throws(() => createEmbedder({ provider: 'ollama' }), (err) => err.code === 'INVALID_CONFIG');
+});
+
+test('网络失败 / 非 JSON 响应 → EMBED_FAILED（openai 与 ollama 两 provider）', async () => {
+  // openai 网络失败
+  const m1 = mockFetch(() => {
+    throw new TypeError('fetch failed: connection refused');
+  });
+  try {
+    const e = createEmbedder({ provider: 'openai-compatible', endpoint: 'https://x/v1/embeddings', model: 'm' });
+    await assert.rejects(e.embed('x'), (err) => err.code === 'EMBED_FAILED');
+  } finally {
+    m1.restore();
+  }
+  // openai 响应非 JSON
+  const m2 = mockFetch(() => new Response('<html>gateway error</html>', { status: 200 }));
+  try {
+    const e = createEmbedder({ provider: 'openai-compatible', endpoint: 'https://x/v1/embeddings', model: 'm' });
+    await assert.rejects(e.embed('x'), (err) => err.code === 'EMBED_FAILED');
+  } finally {
+    m2.restore();
+  }
+  // ollama 网络失败
+  const m3 = mockFetch(() => {
+    throw new TypeError('connection refused');
+  });
+  try {
+    const e = createEmbedder({ provider: 'ollama', endpoint: 'http://127.0.0.1:9', model: 'm' });
+    await assert.rejects(e.embed('x'), (err) => err.code === 'EMBED_FAILED');
+  } finally {
+    m3.restore();
+  }
+  // ollama 响应非 JSON
+  const m4 = mockFetch(() => new Response('not json', { status: 200 }));
+  try {
+    const e = createEmbedder({ provider: 'ollama', endpoint: 'http://127.0.0.1:9/', model: 'm' });
+    await assert.rejects(e.embed('x'), (err) => err.code === 'EMBED_FAILED');
+  } finally {
+    m4.restore();
+  }
+});
+
+test('ollama：响应缺 embeddings[0] → EMBED_FAILED', async () => {
+  const m = mockFetch(() => new Response(JSON.stringify({ embeddings: [] }), { status: 200 }));
+  try {
+    const e = createEmbedder({ provider: 'ollama', endpoint: 'http://127.0.0.1:9/', model: 'm' });
+    await assert.rejects(e.embed('x'), (err) => err.code === 'EMBED_FAILED');
+  } finally {
+    m.restore();
+  }
+});
+
+test('memo 超容量逐出最旧（容量 100，LRU 语义）', async () => {
+  let requests = 0;
+  const m = mockFetch(() => {
+    requests += 1;
+    return new Response(JSON.stringify({ data: [{ embedding: [1] }] }), { status: 200 });
+  });
+  try {
+    const e = createEmbedder({ provider: 'openai-compatible', endpoint: 'https://x/v1/embeddings', model: 'm' });
+    for (let i = 0; i < 120; i++) {
+      await e.embed(`text-${i}`);
+    }
+    assert.equal(requests, 120, '120 个不同文本各请求一次');
+    // 最旧 20 个已被逐出（容量 100）→ 重新请求。
+    await e.embed('text-0');
+    await e.embed('text-119');
+    assert.equal(requests, 121, 'text-0 被逐出需重请求，text-119 仍命中缓存');
+  } finally {
+    m.restore();
+  }
+});

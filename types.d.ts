@@ -19,6 +19,40 @@ export type MemoryS3Action =
   | 'recall'
   | 'seed'
   | 'sync'
+  | 'attach'
+  | 'detach'
+
+/** 附件种类（UI 渲染图标用）。 */
+export type MemoryS3AttachmentKind = 'image' | 'document' | 'archive' | 'file'
+
+/** 附件元数据（条目 embeddings 旁的可选数组元素；二进制存 S3 files/{id} 对象）。 */
+export interface MemoryS3Attachment {
+  /** 附件 id（uuid，跨会话稳定；与 objectKey files/{id} 一一对应）。 */
+  id: string
+  /** 原始文件名（basename，无路径分隔符；后缀用于下载还原）。 */
+  name: string
+  /** MIME 类型（魔法字节证实，非仅扩展名）。 */
+  mime: string
+  /** 种类：image / document / archive / file。 */
+  kind: MemoryS3AttachmentKind
+  /** 字节数。 */
+  size: number
+  /** SHA-256 十六进制摘要（下载校验 + 完整性 proof）。 */
+  sha256: string
+  /** S3 对象相对 key（files/{id}；客户端不应假设其他布局）。 */
+  objectKey: string
+  /** 可选说明文字（attach/save 时传入）。 */
+  note?: string
+  /** 挂载时间（epoch ms）。 */
+  createdAt: number
+}
+
+/** 附件输入（save/attach 工具参数）：本地路径 + 可选说明。 */
+export interface MemoryS3AttachmentInput {
+  /** 本地文件路径（插件内做白名单/魔法字节/大小校验，凭据/二进制不进审批 reason）。 */
+  path: string
+  note?: string
+}
 
 /** S3 同步状态。 */
 export interface MemoryS3SyncState {
@@ -56,6 +90,8 @@ export interface MemoryS3Entry {
   lastRecalled: number | null
   /** 嵌入向量（可插拔嵌入器可用时填充；无则向量检索降级为关键词）。 */
   embedding?: number[]
+  /** 附件元数据数组（照片/文件；二进制在 S3 files/ 对象，此处仅元数据投影）。 */
+  attachments?: MemoryS3Attachment[]
   /** workspace 条目的规范化 cwd 键；'' = 全局（跨工作区）。 */
   workspaceKey: string
   /** 规范化 agentPreset 键；'' = 共享层（所有 preset 可见）。 */
@@ -74,6 +110,8 @@ export interface MemoryS3EntryInput {
   workspaceKey?: string
   /** 显式 agentKey；省略时取写方会话 agentPreset。 */
   agentKey?: string
+  /** 可选本地附件（{path, note?}）：探测校验后上传 S3 并挂到条目。 */
+  attachments?: MemoryS3AttachmentInput[]
 }
 
 /** 会话最小形状（插件只读这些面）。 */
@@ -177,6 +215,27 @@ export interface MemoryS3Service {
 
   /** 抑制自动注入而不删除（无审批；仅改本地标志，S3 侧保留）。 */
   forget(id: string, forgotten: boolean): Promise<{ entry: MemoryS3Entry }>
+
+  /** 给已有条目挂附件（审批门；附件对象不可变 + sha256 proof）。 */
+  attach(
+    entryId: string,
+    input: MemoryS3AttachmentInput,
+    write: MemoryS3WriteContext,
+  ): Promise<{ entry: MemoryS3Entry; attachment: MemoryS3Attachment }>
+
+  /** 移除附件（审批门）：删 S3 文件对象 + 条目元数据移除（If-Match）。 */
+  detach(
+    entryId: string,
+    attachmentId: string,
+    write: MemoryS3WriteContext,
+  ): Promise<{ entry: MemoryS3Entry; attachment: MemoryS3Attachment }>
+
+  /** 下载附件到本地（读路径无审批）：sha256 校验后写入目标目录，返回本地路径。 */
+  getFile(
+    entryId: string,
+    attachmentId: string,
+    opts?: { dir?: string },
+  ): Promise<{ attachment: MemoryS3Attachment; path: string; size: number }>
 
   /** 手动同步：拉取远端增量，重建索引。 */
   sync(): Promise<MemoryS3SyncResult>
