@@ -1089,6 +1089,17 @@ const ENTRY_LIST_OUTPUT = {
   items: ENTRY_OUTPUT,
 };
 
+/**
+ * 条目公开投影：从返回给模型/工具层的条目中剔除仅供内部向量召回用的 embedding 字段
+ * （对齐 ENTRY_OUTPUT 的「不含 embedding 向量」声明；768 维浮点不入模型上下文）。
+ * 返回浅拷贝，不污染内部缓存条目（内部向量路径仍可取到嵌入向量）。
+ */
+function toPublicEntry(entry) {
+  if (entry === null || typeof entry !== 'object') return entry;
+  const { embedding, ...rest } = entry;
+  return rest;
+}
+
 /** 附件元数据输出投影（attach/get_file/detach 的 attachment 字段；字段集对齐 types.d.ts）。 */
 const ENTRY_ATTACHMENT_OUTPUT = {
   type: 'object',
@@ -1207,7 +1218,7 @@ function makeMemoryTools(service) {
         exec.signal.throwIfAborted();
         try {
           const result = await service.save(args, writeContextOf(exec));
-          return { ok: true, action: result.action, entry: result.entry };
+          return { ok: true, action: result.action, entry: toPublicEntry(result.entry) };
         } catch (error) {
           return toolCatch(error);
         }
@@ -1243,7 +1254,7 @@ function makeMemoryTools(service) {
             importanceMin: args.importanceMin,
             limit: args.limit,
           });
-          return { ok: true, entries: result.entries, total: result.total, stale: result.stale };
+          return { ok: true, entries: result.entries.map(toPublicEntry), total: result.total, stale: result.stale };
         } catch (error) {
           return toolCatch(error);
         }
@@ -1269,7 +1280,7 @@ function makeMemoryTools(service) {
         exec.signal.throwIfAborted();
         try {
           const result = service.linkedTo(args.id);
-          return { ok: true, entries: result.entries, total: result.total, stale: result.stale };
+          return { ok: true, entries: result.entries.map(toPublicEntry), total: result.total, stale: result.stale };
         } catch (error) {
           return toolCatch(error);
         }
@@ -1305,7 +1316,7 @@ function makeMemoryTools(service) {
             topK: args.topK,
             limit: args.limit,
           });
-          return { ok: true, entries: result.entries, total: result.total, stale: result.stale };
+          return { ok: true, entries: result.entries.map(toPublicEntry), total: result.total, stale: result.stale };
         } catch (error) {
           return toolCatch(error);
         }
@@ -1341,7 +1352,7 @@ function makeMemoryTools(service) {
             limit: args.limit,
             offset: args.offset,
           });
-          return { ok: true, entries: result.entries, total: result.total, stale: result.stale };
+          return { ok: true, entries: result.entries.map(toPublicEntry), total: result.total, stale: result.stale };
         } catch (error) {
           return toolCatch(error);
         }
@@ -1398,7 +1409,7 @@ function makeMemoryTools(service) {
             },
             writeContextOf(exec),
           );
-          return { ok: true, previous: result.previous, entry: result.entry };
+          return { ok: true, previous: toPublicEntry(result.previous), entry: toPublicEntry(result.entry) };
         } catch (error) {
           return toolCatch(error);
         }
@@ -1428,7 +1439,7 @@ function makeMemoryTools(service) {
         exec.signal.throwIfAborted();
         try {
           const result = await service.remove(args.id, writeContextOf(exec));
-          return { ok: true, entry: result.entry };
+          return { ok: true, entry: toPublicEntry(result.entry) };
         } catch (error) {
           return toolCatch(error);
         }
@@ -1461,7 +1472,7 @@ function makeMemoryTools(service) {
         exec.signal.throwIfAborted();
         try {
           const result = await service.forget(args.id, args.forgotten !== false);
-          return { ok: true, entry: result.entry };
+          return { ok: true, entry: toPublicEntry(result.entry) };
         } catch (error) {
           return toolCatch(error);
         }
@@ -1499,7 +1510,7 @@ function makeMemoryTools(service) {
         exec.signal.throwIfAborted();
         try {
           const result = await service.attach(args.id, { path: args.path, note: args.note }, writeContextOf(exec));
-          return { ok: true, entry: result.entry, attachment: result.attachment };
+          return { ok: true, entry: toPublicEntry(result.entry), attachment: result.attachment };
         } catch (error) {
           return toolCatch(error);
         }
@@ -1572,7 +1583,7 @@ function makeMemoryTools(service) {
         exec.signal.throwIfAborted();
         try {
           const result = await service.detach(args.id, args.attachmentId, writeContextOf(exec));
-          return { ok: true, entry: result.entry, attachment: result.attachment };
+          return { ok: true, entry: toPublicEntry(result.entry), attachment: result.attachment };
         } catch (error) {
           return toolCatch(error);
         }
