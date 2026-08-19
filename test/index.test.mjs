@@ -416,6 +416,55 @@ test('memory_s3_status 反映 configured:false（凭据缺失）与缓存计数'
   }
 });
 
+/**
+ * 构造一个「register 方法依赖 this」的 fake settings 服务，镜像真实 dsh-settings
+ * SettingsProvider.register（内部访问 this.registrations）。用于验证插件必须以
+ * 方法调用方式接入 settings 缝——若解构 register 会丢 this，进而抛
+ * "Cannot read properties of undefined (reading 'registrations')" 并降级。
+ * @param {object} overrides 作为「用户设置层」覆盖 base 的字段。
+ */
+function makeFakeSettings(overrides) {
+  const registrations = new Map();
+  const settings = {
+    registrations,
+    register(ns, schema, options) {
+      if (this === undefined || this === null) {
+        throw new TypeError("Cannot read properties of undefined (reading 'registrations')");
+      }
+      if (this.registrations.has(ns)) throw new Error(`settings namespace "${ns}" is already registered`);
+      this.registrations.set(ns, options);
+      // 用户设置层覆盖 base → 解析后的最终值。
+      const resolved = { ...options.base, ...overrides };
+      return { get: () => resolved };
+    },
+  };
+  return settings;
+}
+
+test('settings 缝：以方法调用接入 register，用户层可覆盖 entry config（回归 this 绑定 bug）', async () => {
+  const dir = tempDir();
+  try {
+    const { ctx, tools } = makeCtx();
+    // 注入 fake settings：register 内部用 this.registrations（复现真实 dsh-settings 契约）。
+    ctx.settings = makeFakeSettings({
+      embedder: { provider: 'ollama', endpoint: 'http://127.0.0.1:11434', model: 'nomic-embed-text' },
+    });
+    // entry config 不配 embedder（默认 none）；应由 settings 用户层覆盖为 ollama。
+    apply(ctx, { bucket: 'mem', cacheDir: dir });
+    const statusTool = tools.find((t) => t.name === 'memory_s3_status');
+    const result = await statusTool.execute({}, EXEC());
+    assert.equal(result.ok, true);
+    assert.equal(
+      result.status.embedder,
+      'ollama',
+      'settings 缝应生效（方法调用保持 this 绑定）：用户层覆盖 entry config 默认 none',
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
 test('memory_s3_sync 拉取远端条目并更新缓存索引（mock List+Get）', async () => {
   const dir = tempDir();
   const records = [];

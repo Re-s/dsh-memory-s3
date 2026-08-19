@@ -5,6 +5,29 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.2.1] - 2026-08-19
+
+### Fixed
+
+- **根治 `ctx.settings` register 的 this 绑定 bug**（fix，2026-08-19；对齐 @deepseek-ai/dsh-settings@0.1.0-rc.7 真实契约）：
+  - 接入设置缝时用 `const register = settings?.register` 解构方法再调用——dsh-settings 的 `SettingsProvider.register` 内部访问 `this.registrations`，解构后 `this` 丢失（ESM 严格模式为 `undefined`），抛 `Cannot read properties of undefined (reading 'registrations')`，导致设置缝总是静默降级为 entry config
+  - 改为方法调用 `settings.register(...)`（保持 `this=settings`），设置缝真正生效；用户层（`settings.yaml` 顶层 `memory-s3:` / GUI 设置页）现在可覆盖 entry config
+  - 提供一个返回 `scope.get()` 的 fake settings 回归测试：旧实现下该测试失败（降级为 entry 默认），修复后通过（用户层生效）——证明测试确实捕获此 bug
+- **根治接入向量嵌入后工具输出校验崩溃**（fix，2026-08-19）：
+  - `save/search/backlinks/recall/list/update/remove/forget/attach/detach` 返回的条目含内部 768 维 `embedding` 向量，与公开输出 schema `ENTRY_OUTPUT(additionalProperties:false)` 冲突，工具一返回就报 `"value.entries[i].embedding" is not a declared property`
+  - 新增 `toPublicEntry()` 在工具边界剔除 `embedding`（对齐 ENTRY_OUTPUT「不含 embedding 向量」的既有声明，避免 768 维浮点灌入模型上下文）；内部向量召回路径（`#filterEntries`/recall 打分）不受影响——仅公开投影剥离
+  - 修复以「回归：接入后任一读工具输出都不得泄漏内部 embedding」集成测试锁定
+
+### Added
+
+- **真实 Ollama 集成测试**（test，2026-08-19；验证接入后当前接口上下游都符契约）：
+  - `test/embedder.integration.test.mjs`：`createEmbedder`（ollama provider）直连本机 `/api/embed`，断言 768 维 Float32Array、语义相关句余弦显著高于无关句、memo 一致性与未知模型→`EMBED_FAILED`；Ollama 不可达时整文件优雅 skip
+  - `test/recall.integration.test.mjs`：完整插件栈 `apply→save(#tryEmbed 落真实向量)→recall(向量+RRF)` 召回「语义相关、关键词零重合」记忆；对照组 `provider:none` 同 query 召回 0 **反证向量路径是命中原因**；`status.embedder` 反映 ollama；输出投影回归
+  - `npm test` 基线 213 → **222** 全绿
+- **存量记忆 embedding 回填脚本**（scripts，2026-08-19）：
+  - `scripts/backfill-embeddings.mjs`：为接入前保存的无向量存量条目标算真实 768 维 embedding 写回缓存（写前 `.bak-<ts>/` 备份，幂等可重跑）；进程环境含 AWS 凭据时同步 PUT 回 S3 使 `sync` 持久
+  - 已在现场对 8 条存量记忆执行，重启后 `recall` 语义召回覆盖全部条目
+
 ## [0.2.0] - 2026-08-19
 
 ### Added

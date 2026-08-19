@@ -1763,11 +1763,13 @@ function resolveRuntimeConfig(ctx, config = {}) {
   // 官方 ctx.settings 为可选服务：经反射层安全获取（未挂载 → null），绝不触发
   // "cannot get property settings without inject"，也绝不让设置缝问题拖垮插件树。
   const settings = tryGetSettings(ctx);
-  const register = settings?.register;
-  if (typeof register !== 'function') return base;
+  if (settings == null || typeof settings.register !== 'function') return base;
 
   try {
-    const scope = register(SETTINGS_NS, Config, {
+    // 必须以方法调用（settings.register）而非解构调用：dsh-settings 的实现内部用
+    // this.registrations，解构出的 register 会丢失 this 绑定 → "Cannot read properties
+    // of undefined (reading 'registrations')"，导致设置缝静默降级。方法调用保持 this=settings。
+    const scope = settings.register(SETTINGS_NS, Config, {
       base, // composition base 层 = entry config
       applies: 'restart', // S3/缓存构造较重，配置变更经重启生效
     });
