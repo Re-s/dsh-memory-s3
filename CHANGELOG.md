@@ -5,15 +5,32 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.2.0] - 2026-08-19
 
 ### Added
 
 - **接入 DSH 官方 `ctx.settings` 设置缝**（feat，2026-08-19；对齐 @deepseek-ai/dsh-settings 契约）：
   - 配置改为三层解析：schema 默认值 → 该插件条目配置（`cordis.patch.yml` 的 entry config，composition base 层）→ 用户设置段（`settings.yaml` 顶层 `memory-s3:`，GUI 设置页可编辑）
-  - 无 settings 服务的 profile 自动回退 entry config alone（官方契约：无 provider 时插件不受影响）；settings 注册失败绝不拖垮插件树（catch 回退 base）
+  - 无 settings 服务的 profile 自动回退 entry config alone（官方契约：无 provider 时插件不受影响）
   - 命名空间 `memory-s3` 以 `applies:'restart'` 注册（S3/缓存构造较重，配置变更经重启生效）
   - 新增可选依赖声明 `@deepseek-ai/dsh-settings`（optionalDependencies）
+
+### Fixed
+
+- **根治读路径旧缓存输出校验崩溃**（fix，2026-08-19）：
+  - `memory_s3_search` / `memory_s3_list` / `memory_s3_recall` / `memory_s3_backlinks` 读路径直接返回缓存原始条目；若缓存由更早版本插件写入（缺 v2.1 的 `locked` 字段），工具输出会因 `ENTRY_OUTPUT` 声明 `locked required` 而校验失败（`missing required property "value.entries[i].locked"`）
+  - 新增 `#readCachedEntry(id)` 归一化读取：经 `fromJSON`（幂等补齐默认，`locked→false` 等）保证任何读路径产物满足输出 schema；单条损坏跳过不炸读路径（与 sync 的账本可重建性哲学一致）；`search`/`list`/`recall`/`backlinks` 四读路径统一接入 + 回归测试
+- **根治 `cannot get property "settings" without inject` 启动崩溃**（fix，2026-08-19）：
+  - `ctx.settings` 是 cordis 注入式服务，直接 `ctx.settings?.register` 会在未挂载 settings 的 profile（如 headless）抛错导致插件树启动失败
+  - 改为经 cordis 反射层可选获取 `ctx.reflect.get('settings', false)`（服务未挂载返回 `undefined` 而非抛错），任何设置缝异常都降级为用 entry config——settings 未挂载时插件以 entry config 正常启用、绝不崩/绝不挂起；已挂载时注册命名空间、可在 GUI 设置页补配置
+
+### Changed（docs，2026-08-19）
+
+- **README/ARCHITECTURE/SECURITY/OMDSH_REVIEW 配置通道同步**：环境变量引导补全（S3 凭据 + 向量嵌入 `OPENAI_API_KEY`）；凭据只走环境变量、非敏感配置经官方 `ctx.settings` 缝三层解析、二者严格分离；废弃 `plugins.memory-s3` 子段写法
+
+## [Unreleased]
+
+### Added
 
 - **记忆模型 v2.1 升级**（feat，2026-08-18；设计定稿 docs/MODEL.md）：
   - 类型新增 `moment`（共 5 类：preference/project/decision/history/moment，对应 Tulving 情景记忆——时刻/照片/纪念日）——存量四类型语义不动，moment 对旧数据零影响（兼容演进）
