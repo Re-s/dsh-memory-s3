@@ -487,7 +487,7 @@ class MemoryS3Service {
     const entries = [];
     for (const id of sources) {
       if (this.deleted.has(id)) continue;
-      const entry = this.cache.getEntry(id);
+      const entry = this.#readCachedEntry(id);
       if (entry !== null) entries.push(entry);
     }
     entries.sort((a, b) => b.updatedAt - a.updatedAt);
@@ -534,7 +534,7 @@ class MemoryS3Service {
     const ranked = [...scores.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id);
     const entries = ranked
       .slice(0, limit)
-      .map((id) => this.cache.getEntry(id))
+      .map((id) => this.#readCachedEntry(id))
       .filter((e) => e !== null);
     // 召回计数本地递增（骨架不落 S3；sync 拉取会覆盖为远端值）。
     for (const entry of entries) {
@@ -664,6 +664,22 @@ class MemoryS3Service {
     };
   }
 
+  /**
+   * 读路径的归一化取条目：缓存可能由更早版本插件写入（缺 v2.1 之后的 locked 等
+   * 必需字段），直接原样返回会让工具输出校验失败（ENRY_OUTPUT 声明 locked required）。
+   * fromJSON 幂等且补齐默认（locked→false 等），保证任何读路径产物满足输出 schema。
+   */
+  #readCachedEntry(id) {
+    const raw = this.cache.getEntry(id);
+    if (raw === null) return null;
+    try {
+      return fromJSON(raw);
+    } catch {
+      // 单条损坏不炸读路径：跳过（与 sync 的「账本可重建性优先」哲学一致）。
+      return null;
+    }
+  }
+
   /** 过滤 + updatedAt 倒序排序的缓存条目全量（search/list/recall/快照共用语义）。 */
   #filterEntries(filter = {}) {
     const text = typeof filter.text === 'string' && filter.text !== '' ? filter.text.toLowerCase() : '';
@@ -676,7 +692,7 @@ class MemoryS3Service {
     const ids = new Set([...this.cache.listDiskIds(), ...this.cache.listLocalIds()]);
     for (const id of ids) {
       if (this.deleted.has(id)) continue;
-      const entry = this.cache.getEntry(id);
+      const entry = this.#readCachedEntry(id);
       if (entry === null) continue;
       if (type !== undefined && entry.type !== type) continue;
       if (tags !== null && !tags.every((t) => entry.tags.map((x) => x.toLowerCase()).includes(t))) continue;

@@ -283,6 +283,59 @@ test('memory_s3_save 写路径：审批 → If-None-Match PUT → 缓存 → sea
   }
 });
 
+test('读路径兼容旧缓存：缺 locked 等 v2.1 字段的条目经 search/list 归一化输出', async () => {
+  // 回归：更早版本插件写入的缓存条目没有 v2.1 的 locked 字段，但 ENTRY_OUTPUT
+  // schema 声明 locked required——读路径若不归一化，search/list 输出校验会炸
+  // （missing required property "value.entries[0].locked"）。
+  const dir = tempDir();
+  const records = [];
+  const restore = installFetchMock(records);
+  try {
+    // 预写一个「旧版本」缓存条目（无 locked、无 subject/timeline/links），
+    // 模拟升级前遗留的磁盘缓存。
+    const legacy = {
+      id: 'legacy-1',
+      type: 'preference',
+      title: '旧条目',
+      content: '升级前写入的缓存，没有 v2.1 字段',
+      tags: ['legacy'],
+      importance: 4,
+      source: 'test',
+      createdAt: 1000,
+      updatedAt: 1001,
+      recallCount: 0,
+      lastRecalled: null,
+      workspaceKey: 'wk',
+      agentKey: 'ag',
+    };
+    const entryDir = join(dir, 'entries');
+    const fs = await import('node:fs');
+    fs.mkdirSync(entryDir, { recursive: true });
+    fs.writeFileSync(join(entryDir, 'legacy-1.json'), JSON.stringify(legacy) + '\n', { mode: 0o600 });
+
+    const { ctx, tools } = makeCtx();
+    apply(ctx, { bucket: 'mem', cacheDir: dir });
+
+    // search：旧条目被读路径归一化补上 locked:false，输出不含 embedded/legacy 崩溃。
+    const searchTool = tools.find((t) => t.name === 'memory_s3_search');
+    const search = await searchTool.execute({ text: '升级前' }, EXEC());
+    assert.equal(search.ok, true, 'search 输出应通过校验');
+    assert.equal(search.total, 1);
+    assert.equal(search.entries[0].locked, false, '归一化应补默认 locked:false');
+    assert.equal(search.entries[0].tags[0], 'legacy');
+
+    // list：同样返回 schema 合规条目。
+    const listTool = tools.find((t) => t.name === 'memory_s3_list');
+    const list = await listTool.execute({}, EXEC());
+    assert.equal(list.ok, true, 'list 输出应通过校验');
+    assert.equal(list.total, 1);
+    assert.equal(list.entries[0].locked, false);
+  } finally {
+    restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('memory_s3_save 同 (type,title) → merged（update 审批，携带新旧文本）', async () => {
   const dir = tempDir();
   const records = [];
