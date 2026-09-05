@@ -5,6 +5,54 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.2.2] - 2026-09-05
+
+### Fixed
+
+- **根治「装了但没配 bucket 就整个 profile 起不来」的启动死锁**（fix，2026-09-05）：
+  `Config.bucket` 原为 `Schema.string().required()`。cordis 加载器在调用 `apply()`
+  **之前**就对 entry config 跑 schema 校验，而 bundle 自带的 `cordis.patch.yml` 不带
+  任何 config，于是校验直接抛：
+
+  ```
+  failed to apply loader entry memory-s3 (dsh-memory-s3): invalid config:
+    - $.bucket missing required value (at bucket)
+  ```
+
+  这是**致命错误**：整个 profile 启动失败，Web GUI 完全打不开——用户因此永远没有机会
+  进设置页去填 bucket，形成死锁。README 承诺的「`enabled:false` 整体 return，不留半残」
+  也因此形同虚设：校验发生在加载器层，轮不到插件的 `enabled` 判断执行。
+
+  修复：`bucket` 改为 `Schema.string().default('')`，必填语义下移到 `apply()`——仅当
+  `enabled` 为 true 时要求非空，缺失则打一条可操作告警并**保持插件存活待机**
+  （不注册工具/注入/服务）。「还没配」与「配错了」从此区别对待：前者待机，后者仍响亮抛错。
+
+- **修复 GUI 设置页不显示本插件**（fix，2026-09-05）：
+  `tryGetSettings()` 只在 `apply()` 当刻用 `reflect.get('settings', false)` **同步探测一次**，
+  探测不到就永久降级。但 cordis 不保证插件间挂载顺序，`settings` 服务挂载晚于本插件时
+  命名空间**永远注册不上**，`settings.describe()` 列不出 `memory-s3`，GUI 遂无此设置页。
+
+  修复：新增 `registerWhenSettingsReady()`，用 `ctx.inject(['settings'], …)` 起子 fiber，
+  在服务就绪后补注册命名空间。子 fiber 缺服务只是自身 INACTIVE，不牵连主插件——这是
+  cordis 中表达「可选依赖」的正确方式。
+
+  ⚠️ 注意：**不能**把 `settings` 直接写进顶层 `export const inject`。cordis 的 inject 是
+  阻塞式的（`Fiber._refresh`：任一 inject 服务缺失 → `epoch=INACTIVE` → 永不 apply），
+  实测表现为 `pending (waiting for services: …)` 且进程退出。cordis 4.0.2 的 inject 映射
+  没有 optional 语义。
+
+- **`scope.get()` 回传部分字段时以 base 兜底**（fix，2026-09-05）：宿主实现差异下
+  `scope.get()` 可能只回传用户显式写过的字段（极端情况下是空对象），直接采用会让
+  `enabled`/`bucket` 落成 `undefined`，插件被误判为未启用而静默待机、工具全不注册。
+  改为 `{ ...base, ...merged }` 逐字段兜底。
+
+### Changed
+
+- `dshWorkshop.compatibility.dshVersions` 增列 `0.1.2-rc.1`（实测启动验证通过的宿主版本）。
+- 测试 226 项全绿：新增待机态不注册工具/注入/服务、`Config({})` 通过校验、inject 不含
+  `settings`、晚挂载补注册、`scope.get()` 空对象兜底等回归；原「空 bucket 响亮抛错」的
+  断言按新契约改为待机。
+
 ## [0.2.1] - 2026-08-19
 
 ### Fixed

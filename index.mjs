@@ -11,8 +11,11 @@
 // - systemPrompt 提供者必须同步（rc.6 不 await）：text 回调内禁止 await，只读内存缓存。
 // - 不 append 未注册的会话事件类型（KNOWN_SESSION_EVENT_TYPES 门）：骨架干脆不 append。
 // - enabled:false 整体 return，不留半残。
+// - 「装了但没配」必须能启动：bucket 缺失只待机 + 告警，绝不抛错。抛错会让 cordis 加载器
+//   判定条目失败并拖垮整个 profile，用户连 GUI 都进不去，也就无从配置 bucket（死锁）。
 // - 配置文件三层解析（@deepseek-ai/dsh-settings 契约）：schema 默认 → entry config(base) →
-//   用户设置段。ctx.settings 为可选服务，未挂载/注册失败均无痕回退 entry config。
+//   用户设置段。ctx.settings 为可选服务，未挂载/注册失败均无痕回退 entry config；
+//   挂载晚于本插件时经 ctx.inject 子 fiber 补注册（否则命名空间丢失 → GUI 无设置页）。
 // - 附件（照片/文件）能力：entries 元数据 + files/{id} 二进制对象（不可变、If-None-Match、
 //   sha256 校验）；本地读取经 lib/filemeta.mjs 白名单+魔法字节+大小三层防护；
 //   附件二进制不进审批 reason/审计（只进元数据摘要），文本类附件内容过秘密检测。
@@ -55,6 +58,12 @@ import { strings } from './lib/strings.mjs';
 
 export const name = 'memory-s3';
 
+/**
+ * 只声明必需服务。settings 刻意不进这里：cordis 的 inject 是**阻塞式**的
+ * （Fiber._refresh：任一 inject 服务缺失 → epoch=INACTIVE → 永不 apply），
+ * 把可选服务写进去会让未挂载 settings 的 profile 整个插件不启动。
+ * settings 的时序问题改由 apply() 内的 ctx.inject(['settings'], …) 子 fiber 解决。
+ */
 export const inject = ['tools', 'systemPrompt', 'approval'];
 
 /** 工具名前缀（approval answerer 认领与工具注册共用）。 */
@@ -113,10 +122,16 @@ function sanitizeLinks(links, selfId) {
  * apply 内再显式补默认——与 Config 同源）。
  * embedder.provider 默认 'none'（零配置可用，search 关键词不依赖嵌入）；要启用
  * 向量召回再显式配置 provider/endpoint/apiKeyEnv。
+ *
+ * bucket 刻意不用 .required()：cordis loader 在 apply() 之前就对 entry config 跑
+ * schema 校验，而 bundle 自带的 cordis.patch.yml 不带 config，必填会让校验抛
+ * "$.bucket missing required value" 并拖垮整个 profile 启动（连 GUI 都进不去），
+ * 用户也就永远没有机会在设置页里填这个值。必填语义下移到 apply()：仅当
+ * enabled 为 true 时才要求 bucket 非空，未配置时插件保持存活并降级待机。
  */
 export const Config = Schema.object({
   enabled: Schema.boolean().default(true),
-  bucket: Schema.string().required(),
+  bucket: Schema.string().default(''),
   prefix: Schema.string().default('dsh-memory-s3'),
   endpoint: Schema.string().default(''),
   region: Schema.string().default('us-east-1'),
@@ -1691,7 +1706,10 @@ function makeMemoryTools(service) {
 
 /**
  * 插件挂载。enabled:false → 整体 return（工具/服务/注入/审批 answerer 全部消失）。
- * 加载期校验（SECURITY.md §8）：bucket 非空、endpoint 协议、数值范围——非法响亮抛错。
+ * bucket 未配置 → 同样整体 return，但只 WARN 不抛错：这是「已装未配」的合法待机态，
+ * 抛错会拖垮整个 profile 启动，用户就再也进不到 GUI 去填这个值。
+ * 加载期校验（SECURITY.md §8）：endpoint 协议、数值范围、白名单类型——非法响亮抛错
+ * （这些是**写错了**的配置，与「还没配」性质不同，必须响亮失败）。
  * 凭据缺失 → WARN + configured:false（插件仍加载，读走缓存/空）。
  */
 /** 镜像 ctx.settings 官方类型（@deepseek-ai/dsh-settings）。
@@ -1718,6 +1736,40 @@ function tryGetSettings(ctx) {
   } catch {
     // 任何访问异常（含 cordis "cannot get ... without inject"）都不可拖垮启动。
     return null;
+  }
+}
+
+/**
+ * settings 服务晚于本插件挂载时的补注册路径。
+ *
+ * cordis 不保证插件间的挂载顺序，因此 apply() 当刻同步探测不到 settings 是正常情况。
+ * 这里用 ctx.inject 起一个子 fiber：它只在 settings 就绪后运行（缺服务时子 fiber 自身
+ * 保持 INACTIVE，不牵连主插件），从而保证命名空间最终一定注册上，GUI 设置页可见。
+ *
+ * 注册用的是 base（entry config 层）；本次进程内不重读已生效的运行时配置——
+ * 契约是 applies:'restart'，用户在设置页改完重启即生效。
+ *
+ * @param {object} ctx - 插件上下文。
+ * @param {object} base - schema 默认强化后的 entry config 层。
+ * @returns {void}
+ */
+function registerWhenSettingsReady(ctx, base) {
+  if (typeof ctx?.inject !== 'function') return;
+  try {
+    ctx.inject(['settings'], (scoped) => {
+      const settings = tryGetSettings(scoped);
+      if (settings == null || typeof settings.register !== 'function') return;
+      try {
+        settings.register(SETTINGS_NS, Config, { base, applies: 'restart' });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[memory-s3] deferred settings registration skipped (${message}); using entry config`);
+      }
+    });
+  } catch (error) {
+    // ctx.inject 不可用（宿主过旧）等一律静默降级：绝不因设置缝拖垮插件树。
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[memory-s3] settings watch unavailable (${message}); using entry config`);
   }
 }
 
@@ -1763,7 +1815,15 @@ function resolveRuntimeConfig(ctx, config = {}) {
   // 官方 ctx.settings 为可选服务：经反射层安全获取（未挂载 → null），绝不触发
   // "cannot get property settings without inject"，也绝不让设置缝问题拖垮插件树。
   const settings = tryGetSettings(ctx);
-  if (settings == null || typeof settings.register !== 'function') return base;
+  if (settings == null || typeof settings.register !== 'function') {
+    // 此刻不可用 ≠ 永远不可用：settings 可能只是挂载得比本插件晚（加载顺序无保证）。
+    // 同步探测一次就永久降级，会让命名空间永不注册 → GUI 设置页缺失该插件。
+    // 用 ctx.inject 起一个子 fiber：settings 就绪时补注册（applies:'restart'，
+    // 本次进程沿用 base，用户改完设置重启即生效）。子 fiber 缺服务只是自己不跑，
+    // 不影响主插件——这也是 cordis 里表达「可选依赖」的正确方式。
+    registerWhenSettingsReady(ctx, base);
+    return base;
+  }
 
   try {
     // 必须以方法调用（settings.register）而非解构调用：dsh-settings 的实现内部用
@@ -1774,7 +1834,13 @@ function resolveRuntimeConfig(ctx, config = {}) {
       applies: 'restart', // S3/缓存构造较重，配置变更经重启生效
     });
     // 解析后的三层合并值（用户可经 GUI 设置页 / settings.yaml 覆盖 base）。
-    return scope && typeof scope.get === 'function' ? scope.get() : base;
+    // 以 base 兜底逐字段展开：scope.get() 若因宿主实现差异回传部分字段（甚至空对象），
+    // 直接采用会让 enabled/bucket 等落成 undefined，插件被误判为未启用而静默待机。
+    if (scope && typeof scope.get === 'function') {
+      const merged = scope.get();
+      return merged && typeof merged === 'object' ? { ...base, ...merged } : base;
+    }
+    return base;
   } catch (error) {
     // settings 不可用/注册失败绝不拖垮插件树：退回 entry config（符合官方容错语义）。
     const message = error instanceof Error ? error.message : String(error);
@@ -1787,8 +1853,15 @@ export function apply(ctx, config = {}) {
   const resolved = resolveRuntimeConfig(ctx, config);
   if (resolved.enabled === false) return;
 
-  if (typeof resolved.bucket !== 'string' || resolved.bucket === '') {
-    throw invalidConfig('bucket must be a non-empty string');
+  // bucket 未填 = 「已装但未配置」，不是错误：抛错会拖垮整个 profile 启动，用户连
+  // GUI 设置页都进不去，也就永远没机会填这个值（死锁）。此处保持插件存活并待机——
+  // 命名空间已在 resolveRuntimeConfig 注册，设置页可见，填好 bucket 重启即生效。
+  if (typeof resolved.bucket !== 'string' || resolved.bucket.trim() === '') {
+    console.warn(
+      '[memory-s3] bucket not configured; plugin stands by (no tools/injection registered). ' +
+        `Set a bucket in the "${SETTINGS_NS}" settings section, then restart the profile.`,
+    );
+    return;
   }
   if (!['ask', 'auto', 'off'].includes(resolved.writePolicy)) {
     throw invalidConfig(`writePolicy must be ask|auto|off (got ${JSON.stringify(resolved.writePolicy)})`);

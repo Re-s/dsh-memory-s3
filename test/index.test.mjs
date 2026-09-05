@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { apply, Config } from '../index.mjs';
+import { apply, Config, inject } from '../index.mjs';
 import { strings } from '../lib/strings.mjs';
 import { parseWriteReason } from '../lib/gate.mjs';
 
@@ -1404,7 +1404,6 @@ test('apply 配置校验：非法 config 响亮抛错（INVALID_CONFIG）', () =
   const { ctx } = makeCtx();
   const expectInvalid = (config) =>
     assert.throws(() => apply(ctx, { bucket: 'mem', ...config }), (err) => err.code === 'INVALID_CONFIG');
-  expectInvalid({ bucket: '' });
   expectInvalid({ writePolicy: 'maybe' });
   expectInvalid({ snapshotOrder: 'soon' });
   expectInvalid({ maxInjectedItems: 0 });
@@ -1417,6 +1416,78 @@ test('apply 配置校验：非法 config 响亮抛错（INVALID_CONFIG）', () =
   // http:// 合法（本地 MinIO 场景，仅告警）——注册不应抛。
   const { ctx: ctx2 } = makeCtx();
   assert.doesNotThrow(() => apply(ctx2, { bucket: 'mem', cacheDir: tempDir(), endpoint: 'http://127.0.0.1:9000' }));
+});
+
+test('apply 待机态：bucket 未配置不抛错，保持存活且不注册工具/注入/服务', () => {
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (msg) => warnings.push(String(msg));
+  try {
+    for (const bucket of [undefined, '', '   ']) {
+      const { ctx, tools, sections, provided } = makeCtx();
+      // 关键契约：抛错会拖垮整个 profile 启动，用户连设置页都进不去 → 无法填 bucket（死锁）。
+      assert.doesNotThrow(() => apply(ctx, bucket === undefined ? {} : { bucket }));
+      assert.equal(tools.length, 0, '待机态不应注册任何工具');
+      assert.equal(sections.length, 0, '待机态不应注册 systemPrompt 注入');
+      assert.equal(provided.size, 0, '待机态不应 provide 服务');
+    }
+    assert.equal(warnings.length, 3, '每次待机都应给出一条可操作告警');
+    assert.match(warnings[0], /bucket not configured/);
+    assert.match(warnings[0], /stands by/);
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
+test('Config schema：bucket 可选（缺失不抛），加载器预校验不因未配置而失败', () => {
+  // cordis loader 在 apply() 前跑 Config 校验；bundle 自带 patch 不带 config，
+  // 若 bucket 必填则校验抛 "$.bucket missing required value" → 整个 profile 起不来。
+  assert.doesNotThrow(() => Config({}), '空 config 必须通过 schema 校验');
+  assert.equal(Config({}).bucket, '', 'bucket 缺失应落到空串默认值');
+  assert.equal(Config({ bucket: 'mem' }).bucket, 'mem');
+});
+
+test('inject 声明：只含必需服务，settings 不得进入（cordis inject 是阻塞式的）', () => {
+  // Fiber._refresh：任一 inject 服务缺失 → epoch=INACTIVE → 永不 apply。
+  // 把可选服务 settings 写进 inject，会让未挂载设置服务的 profile 整个插件不启动
+  // （实测表现为 "pending (waiting for services: …)" 且进程退出）。
+  assert.deepEqual(inject, ['tools', 'systemPrompt', 'approval']);
+  assert.ok(!inject.includes('settings'), 'settings 是可选服务，必须走 ctx.inject 子 fiber');
+});
+
+test('settings scope.get() 回传部分字段时以 base 兜底，不因缺字段被误判为未启用', () => {
+  const { ctx, tools } = makeCtx();
+  // 宿主实现差异下 scope.get() 可能只回传用户显式写过的字段（极端情况下是空对象）。
+  // 若直接采用，enabled/bucket 会落成 undefined → 插件静默待机，工具全不注册。
+  const settings = { register: () => ({ get: () => ({}) }) };
+  ctx.reflect = { get: (n) => (n === 'settings' ? settings : undefined) };
+  apply(ctx, { bucket: 'mem', cacheDir: tempDir() });
+  assert.ok(tools.length > 0, 'scope.get() 回传空对象时应回落 base 并正常注册工具');
+});
+
+test('settings 晚挂载：apply 时探测不到也会经 ctx.inject 子 fiber 补注册命名空间', () => {
+  const { ctx, tools } = makeCtx();
+  const injectCalls = [];
+  let registered = null;
+  // 模拟宿主：apply 当刻 settings 尚未挂载（reflect 拿不到），随后才就绪。
+  ctx.reflect = { get: () => undefined };
+  ctx.inject = (deps, cb) => {
+    injectCalls.push(deps);
+    cb({
+      reflect: {
+        get: (name) => (name === 'settings'
+          ? { register: (ns, schema, opts) => { registered = { ns, opts }; return { get: () => ({}) }; } }
+          : undefined),
+      },
+    });
+    return () => {};
+  };
+  apply(ctx, { bucket: 'mem', cacheDir: tempDir() });
+  assert.deepEqual(injectCalls, [['settings']], '应以子 fiber 方式等待 settings 就绪');
+  assert.ok(registered, 'settings 就绪后必须补注册命名空间，否则 GUI 设置页看不到该插件');
+  assert.equal(registered.ns, 'memory-s3');
+  assert.equal(registered.opts.applies, 'restart');
+  assert.ok(tools.length > 0, '主插件不受可选服务影响，工具照常注册');
 });
 
 test('strings 词表：zh 词表可用（snapshotHeader 插值），未知 lang 回退 en', () => {

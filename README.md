@@ -71,6 +71,17 @@ export OPENAI_API_KEY=...      # 或按 embedder.apiKeyEnv 改名的变量
 >
 > S3 凭据只从环境变量读取（`accessKeyEnv`/`secretKeyEnv`，默认 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`），绝不落盘、绝不进设置文档。
 
+**装完还没配 bucket 时会怎样（0.2.2+）**：插件保持存活但待机，不注册任何工具/注入，启动日志给出一条告警：
+
+```
+[memory-s3] bucket not configured; plugin stands by (no tools/injection registered).
+Set a bucket in the "memory-s3" settings section, then restart the profile.
+```
+
+profile 正常启动、GUI 正常打开，`memory-s3` 设置页可见——在里面填好 bucket 重启即生效（配置变更契约为 `applies: 'restart'`）。
+
+> 0.2.1 及更早版本存在启动死锁：`bucket` 在 schema 层必填，而 cordis 加载器在 `apply()` 之前校验 entry config，未配置时直接抛 `$.bucket missing required value` 并使**整个 profile 启动失败**，连 GUI 都打不开，也就无从配置。若你卡在这个版本，临时解法是在 profile 的 `cordis.patch.yml` 里给 `- id: memory-s3` 补一个 `config.bucket` 占位值；建议直接升级到 0.2.2+。
+
 #### 方式一：官方设置缝（推荐，GUI 设置页可编辑）——`$DSH_HOME/settings.yaml`
 
 在 `settings.yaml` **顶层**写 `memory-s3:` 段（不是旧文档的 `plugins.memory-s3` 子段）：

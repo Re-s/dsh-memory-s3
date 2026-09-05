@@ -1,7 +1,7 @@
 {
   "name": "dsh-memory-s3",
   "description": "Cloud-backed cross-session memory for DeepSeek Harness: structured entries + vector retrieval persisted to S3-compatible object storage (AWS S3 / MinIO / R2 / OSS), with local cache projection, approval-gated writes and auditable trails",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "main": "./index.mjs",
   "types": "./types.d.ts",
@@ -56,7 +56,7 @@
       "credentials:env"
     ],
     "compatibility": {
-      "dshVersions": ["0.1.0-rc.6"]
+      "dshVersions": ["0.1.0-rc.6", "0.1.2-rc.1"]
     },
     "capability": {
       "id": "memory-s3",
