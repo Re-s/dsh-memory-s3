@@ -82,11 +82,21 @@ function makeCtx() {
       fn();
       return () => {};
     },
+    // 模拟 cordis 语义：inject 回调在所需服务就绪时运行并收到 scoped context。
+    // 默认立即运行（多数用例不关心 settings 时序）；关心时序的用例自行覆盖 ctx.inject。
+    inject: (deps, cb) => {
+      cb(ctx);
+      return () => {};
+    },
   };
   return {
     ctx,
     tools,
     sections,
+    /** 模拟宿主在插件树就绪后触发 ready（兜底路径依赖它）。 */
+    emitReady() {
+      listeners.get('ready')?.fn?.();
+    },
     listeners,
     provided,
     approvalCalls,
@@ -423,19 +433,25 @@ test('memory_s3_status 反映 configured:false（凭据缺失）与缓存计数'
  * "Cannot read properties of undefined (reading 'registrations')" 并降级。
  * @param {object} overrides 作为「用户设置层」覆盖 base 的字段。
  */
+/**
+ * 官方 settings 服务替身，契约对齐 @deepseek-ai/dsh-settings 的 `installSection`
+ * （见官方插件 dsh-tool-subagent/lib/model-selection-settings.js）：
+ * 由服务方法完成命名空间注册 + 三层解析，并经 hooks.setSource 把配置源换成 thunk。
+ */
 function makeFakeSettings(overrides) {
   const registrations = new Map();
   const settings = {
     registrations,
-    register(ns, schema, options) {
+    installSection(owner, ns, schema, entry, hooks) {
       if (this === undefined || this === null) {
         throw new TypeError("Cannot read properties of undefined (reading 'registrations')");
       }
       if (this.registrations.has(ns)) throw new Error(`settings namespace "${ns}" is already registered`);
-      this.registrations.set(ns, options);
-      // 用户设置层覆盖 base → 解析后的最终值。
-      const resolved = { ...options.base, ...overrides };
-      return { get: () => resolved };
+      this.registrations.set(ns, { entry, hooks });
+      // 用户设置层覆盖 entry（composition base）→ 解析后的最终值。
+      const resolved = { ...entry, ...overrides };
+      hooks?.setSource?.(() => resolved);
+      return () => this.registrations.delete(ns);
     },
   };
   return settings;
@@ -1465,29 +1481,105 @@ test('settings scope.get() 回传部分字段时以 base 兜底，不因缺字�
   assert.ok(tools.length > 0, 'scope.get() 回传空对象时应回落 base 并正常注册工具');
 });
 
-test('settings 晚挂载：apply 时探测不到也会经 ctx.inject 子 fiber 补注册命名空间', () => {
-  const { ctx, tools } = makeCtx();
-  const injectCalls = [];
-  let registered = null;
-  // 模拟宿主：apply 当刻 settings 尚未挂载（reflect 拿不到），随后才就绪。
-  ctx.reflect = { get: () => undefined };
-  ctx.inject = (deps, cb) => {
-    injectCalls.push(deps);
-    cb({
-      reflect: {
-        get: (name) => (name === 'settings'
-          ? { register: (ns, schema, opts) => { registered = { ns, opts }; return { get: () => ({}) }; } }
-          : undefined),
-      },
-    });
-    return () => {};
-  };
+test('无 settings 服务的 profile：inject 回调永不运行，也必须以 entry config 正常挂载', () => {
+  const harness = makeCtx();
+  const { ctx, tools } = harness;
+  // cordis 实测语义：所需服务从未挂载 → inject 回调永不运行。
+  ctx.inject = () => () => {};
   apply(ctx, { bucket: 'mem', cacheDir: tempDir() });
-  assert.deepEqual(injectCalls, [['settings']], '应以子 fiber 方式等待 settings 就绪');
-  assert.ok(registered, 'settings 就绪后必须补注册命名空间，否则 GUI 设置页看不到该插件');
-  assert.equal(registered.ns, 'memory-s3');
-  assert.equal(registered.opts.applies, 'restart');
-  assert.ok(tools.length > 0, '主插件不受可选服务影响，工具照常注册');
+  // 兜底挂在宿主的 ready 事件上（不用定时器——实测定时兜底会抢在服务就绪前跑）。
+  // 若插件把挂载完全押在 inject 回调上，这里就会一个工具都没有（插件形同未安装）。
+  harness.emitReady();
+  assert.ok(tools.length > 0, '无 settings 提供者时应回落 entry config 并正常注册工具');
+});
+
+test('settings 接线经 scoped context 的 installSection，且命名空间/base 正确', async () => {
+  const dir = tempDir();
+  try {
+    const { ctx, tools } = makeCtx();
+    let captured = null;
+    ctx.settings = {
+      registrations: new Map(),
+      installSection(owner, ns, schema, entry, hooks) {
+        captured = { ns, entry, hasSetSource: typeof hooks?.setSource === 'function' };
+        hooks?.setSource?.(() => ({ ...entry, bucket: 'settings-bucket' }));
+        return () => {};
+      },
+    };
+    apply(ctx, { bucket: 'entry-bucket', cacheDir: dir });
+    assert.ok(captured, '必须经 settings.installSection 注册，否则用户设置段静默失效');
+    assert.equal(captured.ns, 'memory-s3');
+    assert.equal(captured.entry.bucket, 'entry-bucket', 'entry config 应作为 composition base 传入');
+    assert.ok(captured.hasSetSource, '必须接线 setSource（配置源为可重读 thunk，非快照）');
+    assert.ok(tools.length > 0, '插件照常挂载');
+    // 用户层覆盖生效：source thunk 回传的 bucket 应胜出 entry config。
+    const status = await tools.find((t) => t.name === 'memory_s3_status').execute({}, EXEC());
+    assert.equal(status.ok, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('挂载时机由官方 onChange 通知驱动：inject 回调异步到达也不丢用户设置段', async () => {
+  const dir = tempDir();
+  try {
+    const harness = makeCtx();
+    const { ctx, tools } = harness;
+    // 复现实测的真实时序：inject 回调**异步**到达（即使服务已挂载），且晚于
+    // setTimeout(0) 宏任务批次——任何定时兜底都会抢跑并丢掉用户设置段。
+    let deferred;
+    ctx.inject = (deps, cb) => {
+      deferred = () => cb(ctx);
+      return () => {};
+    };
+    ctx.settings = {
+      installSection(owner, ns, schema, entry, hooks) {
+        // 官方 installSection 接线后会主动触发一次 onChange（dsh-settings lib:338），
+        // 这是「配置已就位」的唯一可靠通知点。
+        hooks.setSource(() => ({ ...entry, bucket: 'settings-bucket' }));
+        hooks.onChange();
+        return () => {};
+      },
+    };
+    apply(ctx, { bucket: 'entry-bucket', cacheDir: dir });
+    // 先放过一个宏任务批次（即旧实现的定时兜底窗口），此时不得抢先挂载。
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(tools.length, 0, '不得在 settings 到达前抢跑挂载');
+    // inject 回调到达 → installSection → onChange → 以三层合并配置挂载。
+    deferred();
+    assert.ok(tools.length > 0, 'onChange 通知后应完成挂载');
+    const status = await tools.find((t) => t.name === 'memory_s3_status').execute({}, EXEC());
+    assert.equal(status.ok, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('settings 服务未就绪：不得因等待服务而不挂载（必有 entry config 兜底）', () => {
+  const harness = makeCtx();
+  const { ctx, tools } = harness;
+  // 模拟 cordis 真实语义：服务未就绪 → inject 回调不运行。
+  ctx.inject = () => () => {};
+  apply(ctx, { bucket: 'entry-bucket', cacheDir: tempDir() });
+  harness.emitReady();
+  assert.ok(tools.length > 0, '服务未就绪时应以 entry config 挂载，而非静默不挂载');
+});
+
+test('未 inject 时不得直接读 ctx.settings（会抛 "without inject" 拖垮 profile 启动）', () => {
+  const harness = makeCtx();
+  const { ctx, tools } = harness;
+  // 复现 cordis 行为：未经 inject 访问可选服务属性即抛错。
+  Object.defineProperty(ctx, 'settings', {
+    get() {
+      throw new Error('cannot get property "settings" without inject');
+    },
+    configurable: true,
+  });
+  // inject 回调不运行（服务未就绪），apply 绝不能在 inject 之外触碰 ctx.settings。
+  ctx.inject = () => () => {};
+  assert.doesNotThrow(() => apply(ctx, { bucket: 'mem', cacheDir: tempDir() }));
+  harness.emitReady();
+  assert.ok(tools.length > 0, '仍应以 entry config 正常挂载');
 });
 
 test('strings 词表：zh 词表可用（snapshotHeader 插值），未知 lang 回退 en', () => {

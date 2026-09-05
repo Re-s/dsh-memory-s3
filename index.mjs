@@ -1712,78 +1712,21 @@ function makeMemoryTools(service) {
  * （这些是**写错了**的配置，与「还没配」性质不同，必须响亮失败）。
  * 凭据缺失 → WARN + configured:false（插件仍加载，读走缓存/空）。
  */
-/** 镜像 ctx.settings 官方类型（@deepseek-ai/dsh-settings）。
-    实际经 cordis 反射层可选获取，避免把 settings 声明进 inject（那样在未挂载
-    settings 的 profile 会导致插件挂起等待）。 */
+/** 本插件拥有的官方 settings 命名空间（`settings.yaml` 顶层同名段）。 */
 const SETTINGS_NS = 'memory-s3';
 
 /**
- * 安全获取官方 ctx.settings 服务实例。
- * - 优先走 cordis 反射层 `ctx.reflect.get(name, false)`——服务未挂载时返回
- *   `undefined` 而非抛错（官方可选服务获取方式，见 cordis reflect._getImpl）;
- * - 失败/异常一律返回 null，调用方据此降级。
- * @param {object} ctx - 插件上下文。
- * @returns {object|null} settings 服务，或 null（未挂载/不可达）。
- */
-function tryGetSettings(ctx) {
-  try {
-    // 反射层可选获取：未提供 → undefined，不触发 "without inject"。
-    const viaReflect = ctx?.reflect?.get?.('settings', false);
-    if (viaReflect != null) return viaReflect;
-    // 兜底：某些宿主已把 settings 直接注入 ctx（有界访问，异常即降级）。
-    if (ctx && typeof ctx.settings === 'object' && ctx.settings !== null) return ctx.settings;
-    return null;
-  } catch {
-    // 任何访问异常（含 cordis "cannot get ... without inject"）都不可拖垮启动。
-    return null;
-  }
-}
-
-/**
- * settings 服务晚于本插件挂载时的补注册路径。
+ * 将 entry config 规整为「schema 默认强化」的 base 层。
  *
- * cordis 不保证插件间的挂载顺序，因此 apply() 当刻同步探测不到 settings 是正常情况。
- * 这里用 ctx.inject 起一个子 fiber：它只在 settings 就绪后运行（缺服务时子 fiber 自身
- * 保持 INACTIVE，不牵连主插件），从而保证命名空间最终一定注册上，GUI 设置页可见。
+ * 这一层即官方 settings 三层解析中的 composition base：
+ * schema 默认 → **base（entry config）** → 用户设置段（`settings.yaml` 顶层 `memory-s3:`）。
+ * 命名空间注册与三层合并由 apply() 经官方 `settings.installSection` 完成，本函数保持纯粹
+ * （不触碰 ctx、不注册任何东西），因此可安全重复调用。
  *
- * 注册用的是 base（entry config 层）；本次进程内不重读已生效的运行时配置——
- * 契约是 applies:'restart'，用户在设置页改完重启即生效。
- *
- * @param {object} ctx - 插件上下文。
- * @param {object} base - schema 默认强化后的 entry config 层。
- * @returns {void}
- */
-function registerWhenSettingsReady(ctx, base) {
-  if (typeof ctx?.inject !== 'function') return;
-  try {
-    ctx.inject(['settings'], (scoped) => {
-      const settings = tryGetSettings(scoped);
-      if (settings == null || typeof settings.register !== 'function') return;
-      try {
-        settings.register(SETTINGS_NS, Config, { base, applies: 'restart' });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        console.warn(`[memory-s3] deferred settings registration skipped (${message}); using entry config`);
-      }
-    });
-  } catch (error) {
-    // ctx.inject 不可用（宿主过旧）等一律静默降级：绝不因设置缝拖垮插件树。
-    const message = error instanceof Error ? error.message : String(error);
-    console.warn(`[memory-s3] settings watch unavailable (${message}); using entry config`);
-  }
-}
-
-/**
- * 将 entry config 规整为「schema 默认强化」的 base 层，并（若官方 ctx.settings 缝已挂载）
- * 注册命名空间做三层解析：schema 默认 → base（entry config 子集）→ 用户 section。
- * 无 settings 服务时完全回退 base（entry config alone）——对齐 dsh-settings 契约
- * 「Without a mounted provider nothing changes」。
- * @param {object} ctx - 插件上下文（ctx.settings 为可选服务）。
  * @param {object} config - 该插件 cordis 条目配置（entry config，= patch override 层）。
- * @returns {object} 驱动本插件的最终 resolved 配置。
+ * @returns {object} schema 默认强化后的 base 配置。
  */
-function resolveRuntimeConfig(ctx, config = {}) {
-  // base = entry config（schema 默认强化）。这也是 settings 的 composition base 层。
+function normalizeEntryConfig(config = {}) {
   const base = {
     enabled: config.enabled ?? true,
     bucket: config.bucket ?? '',
@@ -1812,45 +1755,119 @@ function resolveRuntimeConfig(ctx, config = {}) {
       : DEFAULT_ALLOWED_EXTENSIONS,
   };
 
-  // 官方 ctx.settings 为可选服务：经反射层安全获取（未挂载 → null），绝不触发
-  // "cannot get property settings without inject"，也绝不让设置缝问题拖垮插件树。
-  const settings = tryGetSettings(ctx);
-  if (settings == null || typeof settings.register !== 'function') {
-    // 此刻不可用 ≠ 永远不可用：settings 可能只是挂载得比本插件晚（加载顺序无保证）。
-    // 同步探测一次就永久降级，会让命名空间永不注册 → GUI 设置页缺失该插件。
-    // 用 ctx.inject 起一个子 fiber：settings 就绪时补注册（applies:'restart'，
-    // 本次进程沿用 base，用户改完设置重启即生效）。子 fiber 缺服务只是自己不跑，
-    // 不影响主插件——这也是 cordis 里表达「可选依赖」的正确方式。
-    registerWhenSettingsReady(ctx, base);
-    return base;
+  return base;
+}
+
+/**
+ * 插件入口。
+ *
+ * 关键时序：官方 settings 服务是**可选且可能晚于本插件挂载**的，而用户设置段
+ * （`settings.yaml` 顶层 `memory-s3:`）只能经该服务读到。若在 apply 当刻同步读一次配置
+ * 就定型，用户段永远赶不上——表现为「settings.yaml 里明明填了 bucket，插件却仍报
+ * bucket not configured」。因此这里先经 ctx.inject(['settings']) 等服务就绪、拿到三层
+ * 合并结果，再执行真正的挂载（mountWithConfig）。
+ *
+ * 子 fiber 缺服务只是自身 INACTIVE，不牵连主插件；因此未挂载 settings 服务的 profile
+ * 走 else 分支，以 entry config 直接挂载（官方契约：无 provider 时插件不受影响）。
+ *
+ * 配置变更契约仍是 `applies: 'restart'`：本函数不做热重载，改完设置重启生效。
+ *
+ * @param {object} ctx - 插件上下文。
+ * @param {object} config - entry config（cordis 条目配置层）。
+ * @returns {void}
+ */
+export function apply(ctx, config = {}) {
+  // enabled:false 在 entry config 层即可短路，无需牵动 settings。
+  if (config.enabled === false) return;
+
+  const base = normalizeEntryConfig(config);
+  let mounted = false;
+  const mountOnce = (resolved) => {
+    if (mounted) return;
+    mounted = true;
+    mountWithConfig(ctx, resolved && typeof resolved === 'object' ? { ...base, ...resolved } : base);
+  };
+
+  // 无 inject 的宿主：直接以 entry config 挂载。
+  if (typeof ctx?.inject !== 'function') {
+    mountOnce(base);
+    return;
   }
 
-  try {
-    // 必须以方法调用（settings.register）而非解构调用：dsh-settings 的实现内部用
-    // this.registrations，解构出的 register 会丢失 this 绑定 → "Cannot read properties
-    // of undefined (reading 'registrations')"，导致设置缝静默降级。方法调用保持 this=settings。
-    const scope = settings.register(SETTINGS_NS, Config, {
-      base, // composition base 层 = entry config
-      applies: 'restart', // S3/缓存构造较重，配置变更经重启生效
-    });
-    // 解析后的三层合并值（用户可经 GUI 设置页 / settings.yaml 覆盖 base）。
-    // 以 base 兜底逐字段展开：scope.get() 若因宿主实现差异回传部分字段（甚至空对象），
-    // 直接采用会让 enabled/bucket 等落成 undefined，插件被误判为未启用而静默待机。
-    if (scope && typeof scope.get === 'function') {
-      const merged = scope.get();
-      return merged && typeof merged === 'object' ? { ...base, ...merged } : base;
+  // 配置源接线严格遵循官方 `settings.installSection` 契约（实现见 dsh-settings，
+  // 用法见官方插件 dsh-tool-subagent/lib/model-selection-settings.js）。
+  //
+  // 关键：installSection 在接线完成后会**主动调用 hooks.onChange()**（dsh-settings
+  // lib/index.js:338），这就是官方给出的「配置已就位」通知点。插件在此读 source 即可
+  // 拿到三层合并结果，无需猜测任何时序。
+  //
+  // 实测踩过的坑，全部由此规避：
+  //   1. ctx.inject 回调**异步**执行，且晚于 setTimeout(0) 宏任务批次——任何固定延时
+  //      兜底都会抢跑，导致用户设置段静默失效（settings.yaml 填了 bucket 却报
+  //      bucket not configured）。
+  //   2. 「dsh-settings 包能否解析」也不可作判据：宿主共享层通常都装着它，
+  //      包存在 ≠ 本 profile 挂载了该服务。
+  //   3. settings 只能经 inject 后的 scoped context 访问；裸 ctx 上读 ctx.settings 会抛
+  //      "cannot get property settings without inject" 并拖垮整个 profile 启动。
+  //   4. settings 不能写进顶层 export const inject：cordis 的 inject 是阻塞式的
+  //      （Fiber._refresh：任一服务缺失 → epoch=INACTIVE → 永不 apply）。
+  let settingsSeen = false;
+  ctx.inject(['settings'], (settingsCtx) => {
+    settingsSeen = true;
+    const settings = settingsCtx?.settings;
+    if (settings == null || typeof settings.installSection !== 'function') {
+      mountOnce(base);
+      return;
     }
-    return base;
-  } catch (error) {
-    // settings 不可用/注册失败绝不拖垮插件树：退回 entry config（符合官方容错语义）。
-    const message = error instanceof Error ? error.message : String(error);
-    console.warn(`[memory-s3] settings registration skipped (${message}); using entry config`);
-    return base;
+    let source = () => base;
+    try {
+      settings.installSection(ctx, SETTINGS_NS, Config, base, {
+        setSource: (next) => {
+          if (typeof next === 'function') source = next;
+        },
+        // 官方在接线完成后主动触发一次：此时 source 已指向 resolved scope。
+        // 契约 applies:'restart' → 首次用于挂载，后续变更只提示重启。
+        onChange: () => {
+          if (!mounted) {
+            mountOnce(source());
+            return;
+          }
+          console.warn("[memory-s3] settings changed; restart the profile to apply (applies: 'restart')");
+        },
+      });
+    } catch (error) {
+      // 注册失败绝不拖垮插件树：以 entry config 继续（官方容错语义）。
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(`[memory-s3] settings section skipped (${message}); using entry config`);
+    }
+    // installSection 未按契约触发 onChange（宿主实现差异）时仍需挂载。
+    mountOnce(source());
+  });
+
+  // 本 profile 无 settings 提供者时上面的回调永不执行，插件会形同未安装。
+  // 这里**不使用**定时兜底（实测必抢跑），而是挂在 fiber 的 ready 事件上：
+  // 该事件在插件树全部就绪后触发，此时 settings 若仍未出现，即可断定它不存在。
+  if (typeof ctx.on === 'function') {
+    try {
+      ctx.on('ready', () => {
+        if (!settingsSeen) mountOnce(base);
+      });
+    } catch {
+      // 宿主不支持 ready 事件：退化为立即以 entry config 挂载，保证插件可用。
+      mountOnce(base);
+    }
+  } else {
+    mountOnce(base);
   }
 }
 
-export function apply(ctx, config = {}) {
-  const resolved = resolveRuntimeConfig(ctx, config);
+/**
+ * 真正的挂载逻辑（原 apply 主体）：校验配置、构造 S3/缓存/审计、注册工具与注入。
+ * @param {object} ctx - 插件上下文（可能是 inject 后的 scoped context）。
+ * @param {object} resolved - 三层解析后的最终配置。
+ * @returns {void}
+ */
+function mountWithConfig(ctx, resolved) {
   if (resolved.enabled === false) return;
 
   // bucket 未填 = 「已装但未配置」，不是错误：抛错会拖垮整个 profile 启动，用户连

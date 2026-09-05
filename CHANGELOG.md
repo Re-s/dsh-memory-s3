@@ -5,6 +5,42 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.2.3] - 2026-09-05
+
+### Fixed
+
+- **根治 `settings.yaml` 用户设置段静默失效**（fix，2026-09-05）：用户在 `settings.yaml`
+  顶层 `memory-s3:` 段填了 `bucket`，插件却仍报 `bucket not configured` 并待机——三层解析
+  实际退化为 entry config alone，GUI/文件配置形同虚设。
+
+  根因是配置读取时机错误。0.2.2 在 `apply()` 的**同步段**读一次配置就定型，而实测
+  cordis 的 `ctx.inject(['settings'], …)` 回调是**异步**执行的（即使服务早已挂载），
+  必然晚于同步段，于是永远读到 entry config。
+
+  修复：改为严格遵循官方 `settings.installSection` 契约（实现见 `@deepseek-ai/dsh-settings`
+  `lib/index.js:327-343`，用法参照官方插件 `@deepseek-ai/dsh-tool-subagent` 的
+  `SubagentModelSelectionConfig`）。该方法在接线完成后会**主动调用 `hooks.onChange()`**
+  （同文件 `:338`），这是「配置已就位」的唯一可靠通知点；插件在该回调内读 source thunk
+  并完成挂载，不再猜测任何时序。同时把 `register` 直呼改为官方 `installSection`，
+  由它统一完成命名空间注册、三层解析、source 接线与服务消失时的回落。
+
+  期间验证并排除了三种错误做法，一并记录以免重蹈：
+  - `queueMicrotask` / `setTimeout(0)` 兜底：实测 settings 服务挂载晚于宏任务批次，
+    兜底必然抢跑，用 entry config 覆盖掉用户段；
+  - 以「`@deepseek-ai/dsh-settings` 能否解析」判断服务是否存在：宿主共享层通常都装着
+    该包，**包存在 ≠ 本 profile 挂载了该服务**，会导致无服务的 profile 永不挂载；
+  - 在未 inject 的裸 `ctx` 上读 `ctx.settings`：抛
+    `cannot get property "settings" without inject`，直接拖垮整个 profile 启动。
+
+  「本 profile 无 settings 提供者」的兜底改挂在宿主 `ready` 事件上（插件树就绪后触发，
+  此时服务仍未出现即可断定不存在），不再使用任何定时器。
+
+### Changed
+
+- 测试 231 项全绿：新增「挂载时机由 onChange 驱动，宏任务批次不得抢跑」、「无 settings
+  服务经 ready 兜底仍正常挂载」、「未 inject 不得触碰 ctx.settings」等回归；settings
+  测试替身契约由 `register` 更新为官方 `installSection`。
+
 ## [0.2.2] - 2026-09-05
 
 ### Fixed
