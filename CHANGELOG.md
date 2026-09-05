@@ -27,10 +27,11 @@
   `enabled` 为 true 时要求非空，缺失则打一条可操作告警并**保持插件存活待机**
   （不注册工具/注入/服务）。「还没配」与「配错了」从此区别对待：前者待机，后者仍响亮抛错。
 
-- **修复 GUI 设置页不显示本插件**（fix，2026-09-05）：
+- **修复 settings 命名空间可能永远注册不上**（fix，2026-09-05）：
   `tryGetSettings()` 只在 `apply()` 当刻用 `reflect.get('settings', false)` **同步探测一次**，
   探测不到就永久降级。但 cordis 不保证插件间挂载顺序，`settings` 服务挂载晚于本插件时
-  命名空间**永远注册不上**，`settings.describe()` 列不出 `memory-s3`，GUI 遂无此设置页。
+  命名空间**永远注册不上**，`settings.describe()` 列不出 `memory-s3`——直接后果是
+  `settings.yaml` 的 `memory-s3:` 用户设置段**静默失效**，三层解析退化为 entry config alone。
 
   修复：新增 `registerWhenSettingsReady()`，用 `ctx.inject(['settings'], …)` 起子 fiber，
   在服务就绪后补注册命名空间。子 fiber 缺服务只是自身 INACTIVE，不牵连主插件——这是
@@ -49,6 +50,12 @@
 ### Changed
 
 - `dshWorkshop.compatibility.dshVersions` 增列 `0.1.2-rc.1`（实测启动验证通过的宿主版本）。
+- README 修正「GUI 设置页可编辑」的失准表述：注册命名空间**不等于**有可视化表单入口。
+  官方 `dsh-client-ui-settings-plugins` 的 Plugin configuration 标签页按**双账本交集**渲染
+  （已注册命名空间 ∩ 已注册卡片），「a served namespace no card claims renders nothing」；
+  卡片需插件自带 `dsh.client` 浏览器 bundle，而产出它的 `clientBundle` 预设未随包发布，
+  仓库外插件须自行复刻该构建。本插件为纯 Host 侧插件，只出现在只读的 **Plugin list** 标签页，
+  配置经 `settings.yaml` 编辑——命名空间注册仍是该段生效的前提。
 - 测试 226 项全绿：新增待机态不注册工具/注入/服务、`Config({})` 通过校验、inject 不含
   `settings`、晚挂载补注册、`scope.get()` 空对象兜底等回归；原「空 bucket 响亮抛错」的
   断言按新契约改为待机。

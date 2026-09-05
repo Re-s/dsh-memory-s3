@@ -78,11 +78,32 @@ export OPENAI_API_KEY=...      # 或按 embedder.apiKeyEnv 改名的变量
 Set a bucket in the "memory-s3" settings section, then restart the profile.
 ```
 
-profile 正常启动、GUI 正常打开，`memory-s3` 设置页可见——在里面填好 bucket 重启即生效（配置变更契约为 `applies: 'restart'`）。
+profile 正常启动、GUI 正常打开，插件在设置的 **Plugin list** 只读清单里可见。填好 bucket 后重启生效（配置变更契约为 `applies: 'restart'`）——配置请改 `settings.yaml`，本插件没有 GUI 表单入口，原因见下节。
 
 > 0.2.1 及更早版本存在启动死锁：`bucket` 在 schema 层必填，而 cordis 加载器在 `apply()` 之前校验 entry config，未配置时直接抛 `$.bucket missing required value` 并使**整个 profile 启动失败**，连 GUI 都打不开，也就无从配置。若你卡在这个版本，临时解法是在 profile 的 `cordis.patch.yml` 里给 `- id: memory-s3` 补一个 `config.bucket` 占位值；建议直接升级到 0.2.2+。
 
-#### 方式一：官方设置缝（推荐，GUI 设置页可编辑）——`$DSH_HOME/settings.yaml`
+#### 关于 GUI：为什么设置里没有本插件的表单入口
+
+Web 设置的 **Plugins** 分区有两个标签页，本插件只出现在前者：
+
+| 标签页 | 由谁提供 | 本插件 |
+|---|---|---|
+| **Plugin list**（只读清单） | `dsh-client-ui-settings-plugin-inventory` | ✅ 可见 |
+| **Plugin configuration**（可编辑表单） | `dsh-client-ui-settings-plugins` | ❌ 无入口 |
+
+官方对 Plugin configuration 标签页的渲染规则是**双账本交集**：
+
+> The tab reads which settings namespaces the Host serves and dispatches one slot key per namespace, so what renders is the intersection of two ledgers: the namespaces a live Host plugin registered, and the cards registered under those keys. **A served namespace no card claims renders nothing.**
+
+即：注册了 settings 命名空间**只是必要条件**，还需要一张认领该命名空间的「卡片」。而卡片必须由插件自带浏览器半侧，官方在 Known Limitations 中明确了门槛：
+
+> **A card still needs a browser bundle** — the browser half must be a `dsh.client` package built in the client module system's lazy-CJS factory format, and the `clientBundle` preset that emits it lives in `packages/client/tsdown.client.ts` rather than a published package, **so a plugin outside this repository has to reproduce that build itself.**
+
+本插件是纯 Host 侧插件、不含浏览器 bundle，因此没有可视化表单。**这不影响配置能力**：`settings.yaml` 的 `memory-s3:` 段照常参与官方三层解析（schema 默认 → entry config → 用户设置段），命名空间也已正常注册（否则该段不会生效）。
+
+> 另一条官方限制值得知道：命名空间的注册**不会**主动推送给前端——「the wire announces settings-document commits and connection resets, not registrations」，所以新注册的命名空间要等下一次设置文档提交或重连才会进入前端列表。
+
+#### 方式一：官方设置缝（推荐）——`$DSH_HOME/settings.yaml`
 
 在 `settings.yaml` **顶层**写 `memory-s3:` 段（不是旧文档的 `plugins.memory-s3` 子段）：
 
