@@ -111,7 +111,7 @@ Web 设置的 **Plugins** 分区有两个标签页，本插件只出现在前者
 memory-s3:
   enabled: true
   bucket: my-memory-bucket
-  prefix: agent/memory
+  prefix: dsh-memory-s3 # ⚠️ 多设备共享时必须逐字一致，详见下节「prefix 必须跨设备一致」
   endpoint: ""          # 留空用 AWS；MinIO/R2 填 https://...
   region: us-east-1
   writePolicy: ask      # ask | auto | off
@@ -147,6 +147,46 @@ memory-s3:
 ```
 
 用户设置段（方式一）中出现的字段会覆盖 entry config 的同名字段；entry config 又覆盖 schema 默认值。
+
+### ⚠️ prefix 必须跨设备一致（最容易踩的坑）
+
+`prefix` 决定对象根路径，最终键为：
+
+```
+{bucket}/{prefix}/memories/{type}/{id}.json
+{bucket}/{prefix}/files/{id}            # 附件
+```
+
+`prefix` 留空则直接落在桶根（`{bucket}/memories/...`）。
+
+**同一个桶里，prefix 不同 = 两份互不可见的记忆库。** 而且失败方式极具误导性：
+
+```
+memory_s3_status  → configured: true, sync: ok
+memory_s3_list    → 0 entrie(s)
+```
+
+同步**成功**、却**一条都没有**——因为插件在你配的那个 prefix 下确实什么都没有，而它无从知道数据其实躺在隔壁。没有任何报错，看起来就像「桶是空的」。
+
+排查方法是绕过插件直接列桶（凭据取自环境变量）：
+
+```bash
+curl -s --aws-sigv4 "aws:amz:us-east-1:s3" \
+  --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+  "https://<endpoint-host>/<bucket>/?list-type=2&delimiter=/&max-keys=100" \
+  | grep -oE '<Prefix>[^<]+</Prefix>' | sort -u
+```
+
+看到 `memories/` 直接位于桶根，就说明该用**空** prefix；若看到 `agent/memory/` 之类，就把 prefix 配成它。
+
+几处容易混淆的地方：
+
+- schema 默认值是 `dsh-memory-s3`，**不是空串**。第一台设备若没显式配 prefix，数据会落在 `{bucket}/dsh-memory-s3/memories/...`
+- 本文档早期示例曾用 `agent/memory`，照抄会与默认值不一致
+- 首尾斜杠不参与规范化，`agent/memory` 与 `agent/memory/` 请勿混用
+- 换 prefix 不会迁移已有数据。老数据仍在原路径，需自行用 S3 工具搬迁（或就地改回原 prefix）
+
+> 相关：配置变更契约为 `applies: 'restart'` —— 改完 `prefix` 必须重启 profile 才生效。改完立刻查询仍是 0 条属正常。
 
 ### 使用
 
@@ -201,7 +241,7 @@ dsh-memory-s3/
 - **网络面**：仅出站 HTTPS 到配置的 S3 endpoint 与嵌入端点；无其他出站
 - **静态加密**：依赖 S3 服务端加密（SSE-S3 默认）；本地缓存权限 0600
 - **最小权限**：IAM/桶策略仅允许单 prefix 读写（见 docs/SECURITY.md 示例）
-- **共享即共享数据**：同一 bucket+prefix 的所有 DSH 实例共享记忆；先建立信任边界
+- **共享即共享数据**：同一 bucket+prefix 的所有 DSH 实例共享记忆；先建立信任边界。反之，prefix 不一致的实例**互相看不见**（表现为同步成功但 0 条，见「prefix 必须跨设备一致」）
 - **卸载不删云上数据**：移除插件注册不影响 S3 中的记忆对象
 
 ## 🛠️ 开发
