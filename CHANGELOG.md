@@ -5,6 +5,33 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [0.2.4] - 2026-11-08
+
+### Changed
+
+- **适配 DSH 0.2.x（@deepseek-ai/dsh-settings/0.2.x）**：正式切断对 `settings.installSection`
+  的依赖——0.2.0 世系已删该 API。改为声明式接入口：`Config` schema 的所有用户字段都
+  用 `.volatile()` 标记为活字段，`@deepseek-ai/dsh-settings` 自动为有活字段的 profile entry
+  生成设置卡片（`describe()` 带回 `schema` + `applies: 'live'`），通过对 entry config 的
+  `update()`/`mutate()` / `replace()` 回写，并由 cordis `loader/volatile-update`（不偏历
+  fiber）驱动 Hot-Reload。插件 `apply(ctx, config)` 的 `config` 直接由 loader 的
+  `resolveConfig(runtime, config)` 解析后送达，不再需要 `ctx.inject(['settings'], …)`
+  和 `settings.installSection` 接线。
+- **配置变更契约分成两类**（ARCHITECTURE.md §C 新条）：非活字段（`enabled` / `snapshotOrder` /
+  `maxInjectedItems` / `importanceThreshold` / `maxFileBytes` / `allowedFileTypes`）变动仍
+  走 `applies: restart`（reload fiber）；活字段（`bucket` / `endpoint` / `region` / `prefix` /
+  `writePolicy` / `enable`s / `accessKeyEnv` / `secretKeyEnv` / `sessionTokenEnv` / `cacheDir` /
+  `auditRetentionDays` / `embedder.*`）变动只发 `loader/volatile-update`，插件反注册旧注册面
+  再用新 entry config 重新挂载，**立即生效**。
+- **插件无浏览器 bundle 故无 Settings GUI 表单卡**的说明同步 0.2.x（`describe()` 描述符仍
+  正常通过 entry config 生效，settings.yaml 用户段照常 aktual）。
+- `dshWorkshop.compatibility.dshVersions` 更新为 `["0.2.0-rc.1", "0.2.1-rc.2", "0.2.2-rc.1"]`；
+  可选 peer `@deepseek-ai/dsh-settings` 抬到 `>=0.2.0-rc.1`。
+- 测试：替换 4 个仍沿旧 `installSection` 话术的测试为一个完整的 0.2.x 流水（settings 层
+  等效 mock → entry config 合入 → apply）+ 2 个新测试（`Config` 活字段 Volatile 验证、
+  `loader/volatile-update` 热重载验证）；`Config` 字段统一改为
+  `Schema.*().default(...).volatile()` 并修复 `bucket` 默认值断言。
+
 ## [0.2.3] - 2026-09-05
 
 ### Fixed

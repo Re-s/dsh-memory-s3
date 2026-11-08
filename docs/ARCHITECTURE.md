@@ -91,7 +91,7 @@
 
 ### D7. 凭据与网络面（明确披露，与 dsh-memento「零网络零凭据」哲学分岔）
 - S3 凭据：**仅环境变量** `AWS_ACCESS_KEY_ID/SECRET_ACCESS_KEY/SESSION_TOKEN`（`accessKeyEnv`/`secretKeyEnv` 可改名），进程内读取，绝不落盘；`dsh-credentials` 接入列为后续。
-- **非敏感配置（bucket/endpoint/region/prefix/writePolicy 等）经 DSH 官方 `ctx.settings` 缝三层解析**：schema 默认 → entry config（`cordis.patch.yml` base）→ 用户设置段（`settings.yaml` 顶层 `memory-s3:`；本插件无浏览器半侧，故无 GUI 表单入口，见 README「关于 GUI」）——凭据与配置严格分离，配置文档永不承载凭据。
+- **非敏感配置（bucket/endpoint/region/prefix/writePolicy 等）经 0.2.x 官方设置缝驱动**：所有可编辑字段在 `Config` schema 中用 `.volatile()` 标记为活字段，由 `@deepseek-ai/dsh-settings` 的 `describe()` 为有活字段的 profile entry 生成设置卡片（`applies: 'live'`），`update()`/`mutate()` 回写 profile `cordis.patch.yml` 的 entry config；cordis loader 在 `apply()` 前跑 `resolveConfig(runtime, config)` 把解析好的 entry config（schema 默认 → entry config base → 用户设置段）送达 `apply(ctx, config)`。插件通过监听 `loader/volatile-update` 实现活字段热重载（反注册旧注册面 + 新配置重新注册），非活字段仍走 `applies: restart`。凭据与配置严格分离，配置文档永不承载凭据。
 - **凭据绝不进入条目字段/快照/审计**；秘密检测器（AK/SK 模式启发式）拒绝含凭据形状的写入。
 - 网络面：仅出站 HTTPS 到配置的 S3 endpoint + 嵌入端点。无其他出站。插件权限声明如实披露 network/subprocess 面。
 
@@ -100,7 +100,8 @@
   `INVALID_INPUT` / `NOT_FOUND` / `SECRET_DETECTED`（秘密检测命中，含附件文本内容）/ `DENIED`（审批拒绝或不可用）/ `CONFLICT`（If-Match/If-None-Match 失败）/ `FILE_NOT_FOUND`（附件本地路径不存在）/ `FILE_TOO_LARGE`（附件超 maxFileBytes）/ `UPLOAD_REJECTED`（扩展名/魔数白名单拒绝）/ `CORRUPT_FILE`（附件下载 sha256 不符）
 - **基础设施错误**（非 ok:false 路径，原样抛出）：`S3_UNAVAILABLE`（网络/5xx，retryable，指数退避 ≤3 次）/ `EMBED_FAILED`（嵌入失败，仅日志降级不阻塞写入）/ `S3_ERROR`（其余 4xx，配置错误响亮失败）
 - 可重试错误（网络抖动/5xx）指数退避最多 3 次；仍失败 → 写标记 pending（骨架阶段仅日志），读走缓存降级并标注 stale。
-- 加载期校验：bucket/prefix/endpoint 非法配置响亮失败（schemastery schema 层双保险）；`maxFileBytes` 非正数 / `allowedFileTypes` 空串成员同样响亮失败（SECURITY.md §8）。
+- 加载期校验：bucket/prefix/endpoint 非法配置响亮失败（schemastery schema 层双保险）；`maxFileBytes` 非正数 / `allowedFileTypes` 空串成员同样响亮失败（SECURITY.md §8）。`bucket` 未配置不算错误：进入「已装未配」待机，GUID 与 entry config 仍可补填（SECURITY.md §9）。
+- **配置变更契约**：非活字段（`enabled` / `snapshotOrder` / `maxInjectedItems` / `importanceThreshold` / `maxFileBytes` / `allowedFileTypes` / embedder 默认值）变动 → loader 重启 fiber（再演 `apply`）；活字段（`bucket` / `endpoint` / `region` / `prefix` / `writePolicy` / `accessKeyEnv` / `secretKeyEnv` / `sessionTokenEnv` / `cacheDir` / `auditRetentionDays` / `embedder.*`）变动 → `loader/volatile-update`（不偏历 fiber）→ 插件反注册全部注册面再用新 entry config 重新挂载。
 
 ### D9. 记忆模型 v2.1：五类型 + 四字段 + 反链 + 分层注入（design 定稿 docs/MODEL.md）
 

@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { apply, Config, inject } from '../index.mjs';
+import { apply, Config } from '../index.mjs';
 import { strings } from '../lib/strings.mjs';
 import { parseWriteReason } from '../lib/gate.mjs';
 
@@ -82,6 +82,8 @@ function makeCtx() {
       fn();
       return () => {};
     },
+    // cordis 会给 ctx 注入 logger（插件 Error 路径用）；测试侧静默。
+    logger: { error: () => {}, warn: () => {}, info: () => {} },
     // 模拟 cordis 语义：inject 回调在所需服务就绪时运行并收到 scoped context。
     // 默认立即运行（多数用例不关心 settings 时序）；关心时序的用例自行覆盖 ctx.inject。
     inject: (deps, cb) => {
@@ -434,47 +436,40 @@ test('memory_s3_status 反映 configured:false（凭据缺失）与缓存计数'
  * @param {object} overrides 作为「用户设置层」覆盖 base 的字段。
  */
 /**
- * 官方 settings 服务替身，契约对齐 @deepseek-ai/dsh-settings 的 `installSection`
- * （见官方插件 dsh-tool-subagent/lib/model-selection-settings.js）：
- * 由服务方法完成命名空间注册 + 三层解析，并经 hooks.setSource 把配置源换成 thunk。
+ * 0.2.x settings 层等效 mock。
+ *
+ * 0.2.x 删掉了 `settings.installSection` 缝：插件的 Config 调用 `.volatile()` 声明的活字段
+ * 由 @deepseek-ai/dsh-settings 自动生成设置卡片，经 `update()`/`mutate()` 回写
+ * profile `cordis.patch.yml` 的 entry config（用户设置层）；loader 把合并后的
+ * entry config 送达 apply。此处的 mock 把合并结果记入 `entry`，让测试模拟完整的
+ * “用户设置 → 合并 entry config → apply” 流水。
  */
-function makeFakeSettings(overrides) {
-  const registrations = new Map();
-  const settings = {
-    registrations,
-    installSection(owner, ns, schema, entry, hooks) {
-      if (this === undefined || this === null) {
-        throw new TypeError("Cannot read properties of undefined (reading 'registrations')");
-      }
-      if (this.registrations.has(ns)) throw new Error(`settings namespace "${ns}" is already registered`);
-      this.registrations.set(ns, { entry, hooks });
-      // 用户设置层覆盖 entry（composition base）→ 解析后的最终值。
-      const resolved = { ...entry, ...overrides };
-      hooks?.setSource?.(() => resolved);
-      return () => this.registrations.delete(ns);
+function mockSettingsForm() {
+  const entry = {};
+  return {
+    /** 合并后的 entry config 暴露给测试模拟 loader 送货。 */
+    entry,
+    /** 把用户设置段合并进 entry config，模拟 loader 合并后送货。 */
+    async update(ns, patch) {
+      Object.assign(entry, patch);
+      return entry;
     },
   };
-  return settings;
 }
 
-test('settings 缝：以方法调用接入 register，用户层可覆盖 entry config（回归 this 绑定 bug）', async () => {
+test('0.2.x 设置层：用户设置合入 entry config 后 apply 生效（不再经 installSection）', async () => {
   const dir = tempDir();
   try {
     const { ctx, tools } = makeCtx();
-    // 注入 fake settings：register 内部用 this.registrations（复现真实 dsh-settings 契约）。
-    ctx.settings = makeFakeSettings({
-      embedder: { provider: 'ollama', endpoint: 'http://127.0.0.1:11434', model: 'nomic-embed-text' },
-    });
-    // entry config 不配 embedder（默认 none）；应由 settings 用户层覆盖为 ollama。
-    apply(ctx, { bucket: 'mem', cacheDir: dir });
+    const settings = mockSettingsForm();
+    // 模拟用户通过设置卡片改了 embedder 层（0.2.x 活字段），loader 合并到 entry config。
+    await settings.update('entry-id', { embedder: { provider: 'ollama', endpoint: 'http://127.0.0.1:11434', model: 'nomic-embed-text' } });
+    // apply 读 entry config（而非 settings 插口）—— 用户设置层应完整送达。
+    apply(ctx, { bucket: 'mem', cacheDir: dir, ...settings.entry });
     const statusTool = tools.find((t) => t.name === 'memory_s3_status');
     const result = await statusTool.execute({}, EXEC());
     assert.equal(result.ok, true);
-    assert.equal(
-      result.status.embedder,
-      'ollama',
-      'settings 缝应生效（方法调用保持 this 绑定）：用户层覆盖 entry config 默认 none',
-    );
+    assert.equal(result.status.embedder, 'ollama', '用户设置层合入 entry config 后生效：覆盖默认 none');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1455,131 +1450,94 @@ test('apply 待机态：bucket 未配置不抛错，保持存活且不注册工�
   }
 });
 
-test('Config schema：bucket 可选（缺失不抛），加载器预校验不因未配置而失败', () => {
+test('Config schema：活字段为 Volatile（0.2.x），bucket 可选（缺失不抛），加载器预校验不因未配置而失败', () => {
   // cordis loader 在 apply() 前跑 Config 校验；bundle 自带 patch 不带 config，
   // 若 bucket 必填则校验抛 "$.bucket missing required value" → 整个 profile 起不来。
   assert.doesNotThrow(() => Config({}), '空 config 必须通过 schema 校验');
-  assert.equal(Config({}).bucket, '', 'bucket 缺失应落到空串默认值');
-  assert.equal(Config({ bucket: 'mem' }).bucket, 'mem');
+  assert.equal(Config({}).bucket.get(), '', 'bucket 缺失应落到空串默认值（Volatile 默认）');
+  assert.equal(Config({ bucket: 'mem' }).bucket.get(), 'mem');
 });
 
-test('inject 声明：只含必需服务，settings 不得进入（cordis inject 是阻塞式的）', () => {
-  // Fiber._refresh：任一 inject 服务缺失 → epoch=INACTIVE → 永不 apply。
-  // 把可选服务 settings 写进 inject，会让未挂载设置服务的 profile 整个插件不启动
-  // （实测表现为 "pending (waiting for services: …)" 且进程退出）。
-  assert.deepEqual(inject, ['tools', 'systemPrompt', 'approval']);
-  assert.ok(!inject.includes('settings'), 'settings 是可选服务，必须走 ctx.inject 子 fiber');
-});
-
-test('settings scope.get() 回传部分字段时以 base 兜底，不因缺字段被误判为未启用', () => {
-  const { ctx, tools } = makeCtx();
-  // 宿主实现差异下 scope.get() 可能只回传用户显式写过的字段（极端情况下是空对象）。
-  // 若直接采用，enabled/bucket 会落成 undefined → 插件静默待机，工具全不注册。
-  const settings = { register: () => ({ get: () => ({}) }) };
-  ctx.reflect = { get: (n) => (n === 'settings' ? settings : undefined) };
-  apply(ctx, { bucket: 'mem', cacheDir: tempDir() });
-  assert.ok(tools.length > 0, 'scope.get() 回传空对象时应回落 base 并正常注册工具');
-});
-
-test('无 settings 服务的 profile：inject 回调永不运行，也必须以 entry config 正常挂载', () => {
-  const harness = makeCtx();
-  const { ctx, tools } = harness;
-  // cordis 实测语义：所需服务从未挂载 → inject 回调永不运行。
-  ctx.inject = () => () => {};
-  apply(ctx, { bucket: 'mem', cacheDir: tempDir() });
-  // 兜底挂在宿主的 ready 事件上（不用定时器——实测定时兜底会抢在服务就绪前跑）。
-  // 若插件把挂载完全押在 inject 回调上，这里就会一个工具都没有（插件形同未安装）。
-  harness.emitReady();
-  assert.ok(tools.length > 0, '无 settings 提供者时应回落 entry config 并正常注册工具');
-});
-
-test('settings 接线经 scoped context 的 installSection，且命名空间/base 正确', async () => {
+test('cordis loader 投递：apply 读 Volatile 引用形态的 resolved config（0.2.x 实时递送）', async () => {
   const dir = tempDir();
   try {
     const { ctx, tools } = makeCtx();
-    let captured = null;
-    ctx.settings = {
-      registrations: new Map(),
-      installSection(owner, ns, schema, entry, hooks) {
-        captured = { ns, entry, hasSetSource: typeof hooks?.setSource === 'function' };
-        hooks?.setSource?.(() => ({ ...entry, bucket: 'settings-bucket' }));
-        return () => {};
-      },
+    // 模拟 cordis `resolveConfig` 投递的形态：活字段换成 Volatile 引用（只读 `.get()` 抽当前值），
+    // 非活字段为字面量，schema 默认值已合入。用户设置层经设置卡片写入了 embedder。
+    const vol = (v) => ({ get: () => v });
+    const resolved = {
+      enabled: vol(true),
+      bucket: vol('mem'),
+      prefix: vol('dsh-memory-s3'),
+      endpoint: vol(''),
+      region: vol('eu-west-1'),
+      accessKeyEnv: vol('AWS_ACCESS_KEY_ID'),
+      secretKeyEnv: vol('AWS_SECRET_ACCESS_KEY'),
+      sessionTokenEnv: vol('AWS_SESSION_TOKEN'),
+      writePolicy: vol('ask'),
+      snapshotOrder: vol(-50),
+      maxInjectedItems: vol(5),
+      importanceThreshold: vol(3),
+      embedder: vol({ provider: 'ollama', endpoint: 'http://127.0.0.1:11434', model: 'nomic-embed-text', apiKeyEnv: 'OPENAI_API_KEY', dimensions: 768 }),
+      cacheDir: vol(dir),
+      auditRetentionDays: vol(0),
+      maxFileBytes: vol(31457280),
+      allowedFileTypes: vol(['png', 'jpg']),
     };
-    apply(ctx, { bucket: 'entry-bucket', cacheDir: dir });
-    assert.ok(captured, '必须经 settings.installSection 注册，否则用户设置段静默失效');
-    assert.equal(captured.ns, 'memory-s3');
-    assert.equal(captured.entry.bucket, 'entry-bucket', 'entry config 应作为 composition base 传入');
-    assert.ok(captured.hasSetSource, '必须接线 setSource（配置源为可重读 thunk，非快照）');
-    assert.ok(tools.length > 0, '插件照常挂载');
-    // 用户层覆盖生效：source thunk 回传的 bucket 应胜出 entry config。
-    const status = await tools.find((t) => t.name === 'memory_s3_status').execute({}, EXEC());
-    assert.equal(status.ok, true);
+    apply(ctx, resolved);
+    assert.equal(tools.length, 13, 'Volatile 形态 config 应完整注册 13 个工具');
+    const statusTool = tools.find((t) => t.name === 'memory_s3_status');
+    const result = await statusTool.execute({}, EXEC());
+    assert.equal(result.ok, true);
+    assert.equal(result.status.embedder, 'ollama', 'Volatile 引用应被正确取值：用户设置层覆盖默认 none');
+    assert.equal(result.status.cacheDir, dir, '用户设置层覆盖 entry config 默认 dir');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
-
-test('挂载时机由官方 onChange 通知驱动：inject 回调异步到达也不丢用户设置段', async () => {
+test('entry config 层：用户设置合入后 apply 生效，不依赖 ctx.inject/settings（0.2.x）', async () => {
   const dir = tempDir();
   try {
-    const harness = makeCtx();
-    const { ctx, tools } = harness;
-    // 复现实测的真实时序：inject 回调**异步**到达（即使服务已挂载），且晚于
-    // setTimeout(0) 宏任务批次——任何定时兜底都会抢跑并丢掉用户设置段。
-    let deferred;
-    ctx.inject = (deps, cb) => {
-      deferred = () => cb(ctx);
-      return () => {};
-    };
-    ctx.settings = {
-      installSection(owner, ns, schema, entry, hooks) {
-        // 官方 installSection 接线后会主动触发一次 onChange（dsh-settings lib:338），
-        // 这是「配置已就位」的唯一可靠通知点。
-        hooks.setSource(() => ({ ...entry, bucket: 'settings-bucket' }));
-        hooks.onChange();
-        return () => {};
-      },
-    };
-    apply(ctx, { bucket: 'entry-bucket', cacheDir: dir });
-    // 先放过一个宏任务批次（即旧实现的定时兜底窗口），此时不得抢先挂载。
-    await new Promise((r) => setTimeout(r, 0));
-    assert.equal(tools.length, 0, '不得在 settings 到达前抢跑挂载');
-    // inject 回调到达 → installSection → onChange → 以三层合并配置挂载。
-    deferred();
-    assert.ok(tools.length > 0, 'onChange 通知后应完成挂载');
-    const status = await tools.find((t) => t.name === 'memory_s3_status').execute({}, EXEC());
-    assert.equal(status.ok, true);
+    const { ctx, tools } = makeCtx();
+    apply(ctx, { bucket: 'mem', cacheDir: dir, embedder: { provider: 'ollama', endpoint: 'http://127.0.0.1:11434', model: 'nomic-embed-text' } });
+    assert.ok(tools.length > 0, '无需 settings 注入，entry config 送达即挂载');
+    const statusTool = tools.find((t) => t.name === 'memory_s3_status');
+    const result = await statusTool.execute({}, EXEC());
+    assert.equal(result.ok, true);
+    assert.equal(result.status.embedder, 'ollama', '用户设置层合入 entry config 后生效：覆盖默认 none');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('settings 服务未就绪：不得因等待服务而不挂载（必有 entry config 兜底）', () => {
+test('无 settings 服务时也挂载：apply 不依赖 ctx.inject（0.2.x，inject 不再是可选包装）', () => {
   const harness = makeCtx();
   const { ctx, tools } = harness;
-  // 模拟 cordis 真实语义：服务未就绪 → inject 回调不运行。
-  ctx.inject = () => () => {};
-  apply(ctx, { bucket: 'entry-bucket', cacheDir: tempDir() });
-  harness.emitReady();
-  assert.ok(tools.length > 0, '服务未就绪时应以 entry config 挂载，而非静默不挂载');
+  // cordis 实测语义：inject 只提供必需服务；settings 一经声明即阻塞（Volatile 声明下
+  // 用户设置层通过 entry config 服药），应用层只需 entry config。
+  ctx.inject = undefined;
+  apply(ctx, { bucket: 'mem', cacheDir: tempDir() });
+  assert.ok(tools.length > 0, '未 inject setting 服务时应以 entry config 正常挂载');
 });
 
-test('未 inject 时不得直接读 ctx.settings（会抛 "without inject" 拖垮 profile 启动）', () => {
-  const harness = makeCtx();
-  const { ctx, tools } = harness;
-  // 复现 cordis 行为：未经 inject 访问可选服务属性即抛错。
-  Object.defineProperty(ctx, 'settings', {
-    get() {
-      throw new Error('cannot get property "settings" without inject');
-    },
-    configurable: true,
-  });
-  // inject 回调不运行（服务未就绪），apply 绝不能在 inject 之外触碰 ctx.settings。
-  ctx.inject = () => () => {};
-  assert.doesNotThrow(() => apply(ctx, { bucket: 'mem', cacheDir: tempDir() }));
-  harness.emitReady();
-  assert.ok(tools.length > 0, '仍应以 entry config 正常挂载');
+test('loader/volatile-update：配置变更后 reload（重新注册工具/审批/系统段）', async () => {
+  const dir = tempDir();
+  try {
+    const { ctx, tools, listeners } = makeCtx();
+    apply(ctx, { bucket: 'mem', cacheDir: dir, writePolicy: 'ask', snapshotOrder: -50 });
+    assert.equal(tools.length, 13, '初始挂载 13 个工具');
+    // 模拟 loader 发起 volatile-update：fiber.config 已指向新的 entry config（用户设置段已改）。
+    ctx.fiber = { config: { bucket: 'mem', cacheDir: dir, writePolicy: 'auto', snapshotOrder: -50 } };
+    const listener = listeners.get('loader/volatile-update');
+    assert.ok(listener, '应注册 loader/volatile-update 监听器实现活重载');
+    listener.fn();
+    assert.ok(tools.length > 0, '重装后仍注册工具');
+    const statusTool = tools.find((t) => t.name === 'memory_s3_status');
+    const result = await statusTool.execute({}, EXEC());
+    assert.equal(result.ok, true, '重新挂载后工具可执行');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('strings 词表：zh 词表可用（snapshotHeader 插值），未知 lang 回退 en', () => {

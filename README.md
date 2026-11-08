@@ -61,12 +61,14 @@ export AWS_SESSION_TOKEN=...   # 可选，临时凭据
 export OPENAI_API_KEY=...      # 或按 embedder.apiKeyEnv 改名的变量
 ```
 
-> 凭据只走环境变量；**bucket / endpoint / region / prefix / writePolicy 等非敏感配置**经官方 `ctx.settings` 缝（见下）配置——配置与凭据严格分离。
+> 凭据只走环境变量；**bucket / endpoint / region / prefix / writePolicy 等非敏感配置**经 DSH 官方设置缝配置——配置与凭据严格分离。
+>
+> 0.2.x 形态下，这些字段是 `Config` schema 里带头 `.volatile()` 的活字段（详见 ARCHITECTURE.md §C）：`@deepseek-ai/dsh-settings` 自动为有活字段的 profile entry 生成设置卡片（`describe()` 带回 `schema` + `applies: 'live'`），HMR/`loader/volatile-update` 负责把值写回 entry config 并热重载，改 `bucket`/`endpoint`/`writePolicy` 等活字段**立即生效、不用重启**。`settings.yaml` 顶层 `memory-s3:` 段或 `cordis.patch.yml` 的 entry config 更新，经同一套 `update()`/`mutate()` 进入 entry config，不做二次解析。
 
-### 配置（符合 DSH 官方设置缝 `ctx.settings`）
+### 配置（0.2.x volatile schema）
 
-> 本插件已接入 DSH 官方 `ctx.settings` 缝。配置经三层解析：
-> **schema 默认值 → 该插件条目配置（`cordis.patch.yml` 的 entry config，composition base）→ 用户设置段（`settings.yaml` 顶层 `memory-s3:`）**。
+> 本插件所有可编辑字段（enabled / bucket / prefix / endpoint / region / accessKeyEnv / secretKeyEnv / sessionTokenEnv / writePolicy / snapshotOrder / maxInjectedItems / importanceThreshold / embedder.* / cacheDir / auditRetentionDays / maxFileBytes / allowedFileTypes）都是活字段（Volatile）。配置经同一层 entry config 送达 `apply(ctx, config)`，无需 `settings.installSection`（0.2.0 世系已删）——宿主自动完成三层解析：**schema 默认 → entry config（composition base）→ 用户设置段**。
+>
 > 未挂载 settings 服务的 profile 自动回退到 entry config alone（官方契约：无 provider 时插件不受影响）。
 >
 > S3 凭据只从环境变量读取（`accessKeyEnv`/`secretKeyEnv`，默认 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`），绝不落盘、绝不进设置文档。
@@ -78,7 +80,7 @@ export OPENAI_API_KEY=...      # 或按 embedder.apiKeyEnv 改名的变量
 Set a bucket in the "memory-s3" settings section, then restart the profile.
 ```
 
-profile 正常启动、GUI 正常打开，插件在设置的 **Plugin list** 只读清单里可见。填好 bucket 后重启生效（配置变更契约为 `applies: 'restart'`）——配置请改 `settings.yaml`，本插件没有 GUI 表单入口，原因见下节。
+profile 正常启动、GUI 正常打开，插件在设置的 **Plugin list** 只读清单里可见。填好 bucket 后重启生效（**重启生效的字段：`enabled`、`snapshotOrder`、`maxInjectedItems`、`importanceThreshold`、`maxFileBytes`、`allowedFileTypes` 等非活操作数**；live 的活字段如 `bucket`/`endpoint`/`region`/`prefix`/`writePolicy` 修改后热重载即生效）——配置请改 `settings.yaml`，本插件没有 GUI 表单入口，原因见下节。
 
 > 0.2.1 及更早版本存在启动死锁：`bucket` 在 schema 层必填，而 cordis 加载器在 `apply()` 之前校验 entry config，未配置时直接抛 `$.bucket missing required value` 并使**整个 profile 启动失败**，连 GUI 都打不开，也就无从配置。若你卡在这个版本，临时解法是在 profile 的 `cordis.patch.yml` 里给 `- id: memory-s3` 补一个 `config.bucket` 占位值；建议直接升级到 0.2.2+。
 
@@ -99,7 +101,7 @@ Web 设置的 **Plugins** 分区有两个标签页，本插件只出现在前者
 
 > **A card still needs a browser bundle** — the browser half must be a `dsh.client` package built in the client module system's lazy-CJS factory format, and the `clientBundle` preset that emits it lives in `packages/client/tsdown.client.ts` rather than a published package, **so a plugin outside this repository has to reproduce that build itself.**
 
-本插件是纯 Host 侧插件、不含浏览器 bundle，因此没有可视化表单。**这不影响配置能力**：`settings.yaml` 的 `memory-s3:` 段照常参与官方三层解析（schema 默认 → entry config → 用户设置段），命名空间也已正常注册（否则该段不会生效）。
+本插件是纯 Host 侧插件、不含浏览器 bundle，因此没有可视化表单。**这不影响配置能力**：本插件以 `.volatile()` 声明的 Config 字段（上文 §配置）经 `dsh-settings` 的 `describe()` 形成活字段卡片（`applies: 'live'`），用户设置段（`settings.yaml` 顶层 `memory-s3:`）进入 entry config 的方式不变，只是运行时由 `loader/volatile-update` 热重载新值。
 
 > 另一条官方限制值得知道：命名空间的注册**不会**主动推送给前端——「the wire announces settings-document commits and connection resets, not registrations」，所以新注册的命名空间要等下一次设置文档提交或重连才会进入前端列表。
 
@@ -186,7 +188,7 @@ curl -s --aws-sigv4 "aws:amz:us-east-1:s3" \
 - 首尾斜杠不参与规范化，`agent/memory` 与 `agent/memory/` 请勿混用
 - 换 prefix 不会迁移已有数据。老数据仍在原路径，需自行用 S3 工具搬迁（或就地改回原 prefix）
 
-> 相关：配置变更契约为 `applies: 'restart'` —— 改完 `prefix` 必须重启 profile 才生效。改完立刻查询仍是 0 条属正常。
+> 相关：`prefix` 是活字段（`.volatile()`），改完不重启 profile 也会热重载生效（本插件反注册旧注册面、用新 Entry config 重新挂载）；已存的记忆数据仍躺在旧路径上，需自行用 S3 工具搬迁。
 
 ### 使用
 

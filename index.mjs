@@ -13,9 +13,12 @@
 // - enabled:false 整体 return，不留半残。
 // - 「装了但没配」必须能启动：bucket 缺失只待机 + 告警，绝不抛错。抛错会让 cordis 加载器
 //   判定条目失败并拖垮整个 profile，用户连 GUI 都进不去，也就无从配置 bucket（死锁）。
-// - 配置文件三层解析（@deepseek-ai/dsh-settings 契约）：schema 默认 → entry config(base) →
-//   用户设置段。ctx.settings 为可选服务，未挂载/注册失败均无痕回退 entry config；
-//   挂载晚于本插件时经 ctx.inject 子 fiber 补注册（否则命名空间丢失 → GUI 无设置页）。
+// - 配置文件 0.2.x volatile 面：`Config` 全部可编辑字段 `.volatile()`，宿主的
+//   `@deepseek-ai/dsh-settings` 为有活字段的 profile entry 生成设置卡片（`describe` +
+//   `update`/`replace`/`mutate`，`applies: 'live'`），`entry config` 经 cordis loader
+//   `resolveConfig(runtime, config)` 挂载前解析，送达 `apply(ctx, config)`；插件监听
+//   `loader/volatile-update` 反注册旧注册面 + 用新 entry config 重新挂载。无需
+//   `settings.installSection`（0.2.0 世系已删），也无需 `ctx.inject(['settings'], …)`。
 // - 附件（照片/文件）能力：entries 元数据 + files/{id} 二进制对象（不可变、If-None-Match、
 //   sha256 校验）；本地读取经 lib/filemeta.mjs 白名单+魔法字节+大小三层防护；
 //   附件二进制不进审批 reason/审计（只进元数据摘要），文本类附件内容过秘密检测。
@@ -118,41 +121,44 @@ function sanitizeLinks(links, selfId) {
 }
 
 /**
- * 插件配置（Schemastery，对齐 README.md 配置表；cordis loader 已套默认值，
- * apply 内再显式补默认——与 Config 同源）。
- * embedder.provider 默认 'none'（零配置可用，search 关键词不依赖嵌入）；要启用
- * 向量召回再显式配置 provider/endpoint/apiKeyEnv。
+ * 0.2.x Config：用户可编辑的字段必须用 `.volatile()` 声明为活字段 ——
+ * 它们构成 `dsh-settings` 设置卡片（`describe()` + `update()`/`replace()` + `mutate()`），
+ * 写入 profile `cordis.patch.yml` 的 entry config，通过 `loader/volatile-update`
+ * 触发重载，正式脱离 `settings.installSection`（0.2.0 世系已删）。
  *
- * bucket 刻意不用 .required()：cordis loader 在 apply() 之前就对 entry config 跑
- * schema 校验，而 bundle 自带的 cordis.patch.yml 不带 config，必填会让校验抛
- * "$.bucket missing required value" 并拖垮整个 profile 启动（连 GUI 都进不去），
- * 用户也就永远没有机会在设置页里填这个值。必填语义下移到 apply()：仅当
- * enabled 为 true 时才要求 bucket 非空，未配置时插件保持存活并降级待机。
+ * 注意：0.2.x 不允许 volatile 字段嵌套在另一个 volatile 字段之下
+ * （"volatile fields require a fixed object path without an enclosing volatile field"），
+ * 所以唯一的复杂嵌套 `embedder` 对象本身 volatile、内成员非 volatile；
+ * 读法是 `config.embedder.get().provider`。
+ *
+ * bucket 故意不设 .required()：entry config 在 apply 前就经 schema 校验，
+ * 必填会让未配的 profile 启动失败（死锁：配 bucket 的 GUI 进不去）。
+ * 桶的未配置态作为「已装未配」的合法待机处理，仅 enabled 为 true 时要求非空。
  */
 export const Config = Schema.object({
-  enabled: Schema.boolean().default(true),
-  bucket: Schema.string().default(''),
-  prefix: Schema.string().default('dsh-memory-s3'),
-  endpoint: Schema.string().default(''),
-  region: Schema.string().default('us-east-1'),
-  accessKeyEnv: Schema.string().default('AWS_ACCESS_KEY_ID'),
-  secretKeyEnv: Schema.string().default('AWS_SECRET_ACCESS_KEY'),
-  sessionTokenEnv: Schema.string().default('AWS_SESSION_TOKEN'),
-  writePolicy: Schema.union(['ask', 'auto', 'off']).default('ask'),
-  snapshotOrder: Schema.number().default(-50),
-  maxInjectedItems: Schema.number().default(5),
-  importanceThreshold: Schema.number().default(3),
+  enabled: Schema.boolean().default(true).volatile(),
+  bucket: Schema.string().default('').volatile(),
+  prefix: Schema.string().default('dsh-memory-s3').volatile(),
+  endpoint: Schema.string().default('').volatile(),
+  region: Schema.string().default('us-east-1').volatile(),
+  accessKeyEnv: Schema.string().default('AWS_ACCESS_KEY_ID').volatile(),
+  secretKeyEnv: Schema.string().default('AWS_SECRET_ACCESS_KEY').volatile(),
+  sessionTokenEnv: Schema.string().default('AWS_SESSION_TOKEN').volatile(),
+  writePolicy: Schema.union(['ask', 'auto', 'off']).default('ask').volatile(),
+  snapshotOrder: Schema.number().default(-50).volatile(),
+  maxInjectedItems: Schema.number().default(5).volatile(),
+  importanceThreshold: Schema.number().default(3).volatile(),
   embedder: Schema.object({
     provider: Schema.union(['openai-compatible', 'ollama', 'none']).default('none'),
     endpoint: Schema.string().default(''),
     apiKeyEnv: Schema.string().default('OPENAI_API_KEY'),
     model: Schema.string().default('text-embedding-3-small'),
     dimensions: Schema.number().default(768),
-  }),
-  cacheDir: Schema.string().default(''),
-  auditRetentionDays: Schema.number().default(0),
-  maxFileBytes: Schema.number().default(DEFAULT_MAX_FILE_BYTES),
-  allowedFileTypes: Schema.array(Schema.string()).default(DEFAULT_ALLOWED_EXTENSIONS),
+  }).volatile(),
+  cacheDir: Schema.string().default('').volatile(),
+  auditRetentionDays: Schema.number().default(0).volatile(),
+  maxFileBytes: Schema.number().default(DEFAULT_MAX_FILE_BYTES).volatile(),
+  allowedFileTypes: Schema.array(Schema.string()).default(DEFAULT_ALLOWED_EXTENSIONS).volatile(),
 });
 
 /**
@@ -1704,54 +1710,62 @@ function makeMemoryTools(service) {
   ];
 }
 
+/** 注册面缓存：key 是插件 ctx，value 是本插件经 $ctx 注册的所有 doers（工具/审批/会话/系统段）。 */
+const registered = new WeakMap();
+
 /**
- * 插件挂载。enabled:false → 整体 return（工具/服务/注入/审批 answerer 全部消失）。
- * bucket 未配置 → 同样整体 return，但只 WARN 不抛错：这是「已装未配」的合法待机态，
- * 抛错会拖垮整个 profile 启动，用户就再也进不到 GUI 去填这个值。
- * 加载期校验（SECURITY.md §8）：endpoint 协议、数值范围、白名单类型——非法响亮抛错
- * （这些是**写错了**的配置，与「还没配」性质不同，必须响亮失败）。
- * 凭据缺失 → WARN + configured:false（插件仍加载，读走缓存/空）。
+ * 0.2.x Config 读法：宿主 deliver 的 entry config 里活字段是 Volatile 引用
+ * （`config.bucket` 是个属性，赵 `.get()`），raw 侧（测试/旧宿）直接透传成员值。
+ * @param {object} config - entry config（已合并用户设置段）。
+ * @param {string} key - entry config 字段名。
+ * @returns {unknown} 当前字段值。
  */
-/** 本插件拥有的官方 settings 命名空间（`settings.yaml` 顶层同名段）。 */
-const SETTINGS_NS = 'memory-s3';
+function cfg(config, key) {
+  const value = config?.[key];
+  return value && typeof value.get === 'function' ? value.get() : value;
+}
 
 /**
  * 将 entry config 规整为「schema 默认强化」的 base 层。
  *
- * 这一层即官方 settings 三层解析中的 composition base：
- * schema 默认 → **base（entry config）** → 用户设置段（`settings.yaml` 顶层 `memory-s3:`）。
- * 命名空间注册与三层合并由 apply() 经官方 `settings.installSection` 完成，本函数保持纯粹
- * （不触碰 ctx、不注册任何东西），因此可安全重复调用。
+ * 承上（0.2.x 新形态）：cordis loader 在 apply() 前跑 `resolveConfig(runtime, config)`——
+ * 使用 `.volatile()` 声明的活字段全部换成 Volatile 引用送达 `config`（schema 默认值
+ * 已合入，用户设置层通过设置卡片写 entry config 也合入 resolveConfig）；entry config
+ * raw 侧（测试/旧宿）直接透传成员值。为兼容两种投递形态，所有字段统一经 `cfg()` 读
+ * （有 `.get()` 就读当前值，没有则原样使用），所以本函数对 raw/resolved 都幂等。
+ * 不触碰 ctx、不注册任何东西，因此可安全重复调用。
  *
- * @param {object} config - 该插件 cordis 条目配置（entry config，= patch override 层）。
+ * @param {object} config - 该插件 cordis 条目配置（entry config，= patch override 层；
+ *   也可能是 loader 已解析出的 schema 默认强化态）。
  * @returns {object} schema 默认强化后的 base 配置。
  */
 function normalizeEntryConfig(config = {}) {
+  const embedder = cfg(config, 'embedder') ?? {};
   const base = {
-    enabled: config.enabled ?? true,
-    bucket: config.bucket ?? '',
-    prefix: config.prefix ?? 'dsh-memory-s3',
-    endpoint: config.endpoint ?? '',
-    region: config.region ?? 'us-east-1',
-    accessKeyEnv: config.accessKeyEnv ?? 'AWS_ACCESS_KEY_ID',
-    secretKeyEnv: config.secretKeyEnv ?? 'AWS_SECRET_ACCESS_KEY',
-    sessionTokenEnv: config.sessionTokenEnv ?? 'AWS_SESSION_TOKEN',
-    writePolicy: config.writePolicy ?? 'ask',
-    snapshotOrder: config.snapshotOrder ?? -50,
-    maxInjectedItems: config.maxInjectedItems ?? 5,
-    importanceThreshold: config.importanceThreshold ?? 3,
+    enabled: cfg(config, 'enabled') ?? true,
+    bucket: cfg(config, 'bucket') ?? '',
+    prefix: cfg(config, 'prefix') ?? 'dsh-memory-s3',
+    endpoint: cfg(config, 'endpoint') ?? '',
+    region: cfg(config, 'region') ?? 'us-east-1',
+    accessKeyEnv: cfg(config, 'accessKeyEnv') ?? 'AWS_ACCESS_KEY_ID',
+    secretKeyEnv: cfg(config, 'secretKeyEnv') ?? 'AWS_SECRET_ACCESS_KEY',
+    sessionTokenEnv: cfg(config, 'sessionTokenEnv') ?? 'AWS_SESSION_TOKEN',
+    writePolicy: cfg(config, 'writePolicy') ?? 'ask',
+    snapshotOrder: cfg(config, 'snapshotOrder') ?? -50,
+    maxInjectedItems: cfg(config, 'maxInjectedItems') ?? 5,
+    importanceThreshold: cfg(config, 'importanceThreshold') ?? 3,
     embedder: {
-      provider: config.embedder?.provider ?? 'none',
-      endpoint: config.embedder?.endpoint ?? '',
-      apiKeyEnv: config.embedder?.apiKeyEnv ?? 'OPENAI_API_KEY',
-      model: config.embedder?.model ?? 'text-embedding-3-small',
-      dimensions: config.embedder?.dimensions ?? 768,
+      provider: embedder.provider ?? 'none',
+      endpoint: embedder.endpoint ?? '',
+      apiKeyEnv: embedder.apiKeyEnv ?? 'OPENAI_API_KEY',
+      model: embedder.model ?? 'text-embedding-3-small',
+      dimensions: embedder.dimensions ?? 768,
     },
-    cacheDir: config.cacheDir ?? '',
-    auditRetentionDays: config.auditRetentionDays ?? 0,
-    maxFileBytes: config.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES,
-    allowedFileTypes: Array.isArray(config.allowedFileTypes) && config.allowedFileTypes.length > 0
-      ? config.allowedFileTypes
+    cacheDir: cfg(config, 'cacheDir') ?? '',
+    auditRetentionDays: cfg(config, 'auditRetentionDays') ?? 0,
+    maxFileBytes: cfg(config, 'maxFileBytes') ?? DEFAULT_MAX_FILE_BYTES,
+    allowedFileTypes: Array.isArray(cfg(config, 'allowedFileTypes')) && cfg(config, 'allowedFileTypes').length > 0
+      ? cfg(config, 'allowedFileTypes')
       : DEFAULT_ALLOWED_EXTENSIONS,
   };
 
@@ -1761,212 +1775,189 @@ function normalizeEntryConfig(config = {}) {
 /**
  * 插件入口。
  *
- * 关键时序：官方 settings 服务是**可选且可能晚于本插件挂载**的，而用户设置段
- * （`settings.yaml` 顶层 `memory-s3:`）只能经该服务读到。若在 apply 当刻同步读一次配置
- * 就定型，用户段永远赶不上——表现为「settings.yaml 里明明填了 bucket，插件却仍报
- * bucket not configured」。因此这里先经 ctx.inject(['settings']) 等服务就绪、拿到三层
- * 合并结果，再执行真正的挂载（mountWithConfig）。
+ * 0.2.x 新形态：entry config 经 cordis loader 的 `resolveConfig(runtime, config)` 解析后
+ * 送达 `apply(ctx, config)`——settings 层（旧的开发 `settings.yaml` `memory-s3:` 段
+ * `/ dsh-settings` 设置卡片写入 `cordis.patch.yml` 的 entry patch）已经合入，不再需要
+ * 调 `settings.installSection` 缝（0.2.0 世系已删。）
  *
- * 子 fiber 缺服务只是自身 INACTIVE，不牵连主插件；因此未挂载 settings 服务的 profile
- * 走 else 分支，以 entry config 直接挂载（官方契约：无 provider 时插件不受影响）。
- *
- * 配置变更契约仍是 `applies: 'restart'`：本函数不做热重载，改完设置重启生效。
+ * 配置变更契约：
+ *   - `enabled` 等 **非活字段** 变动 → Loader 重启整个 fiber（偏历 `apply` 重塑）；
+ *   - `bucket` 等 **活字段** 变动 → Loader 仅发 `loader/volatile-update`（不偏历），
+ *     本插件 listen 后重新挂载（先全部反注册，再用新配置注册），确保工具链、审批、
+ *     系统段、快照和 `ctx.memoryS3` 服务同步替换为最新配置。
  *
  * @param {object} ctx - 插件上下文。
  * @param {object} config - entry config（cordis 条目配置层）。
  * @returns {void}
  */
 export function apply(ctx, config = {}) {
-  // enabled:false 在 entry config 层即可短路，无需牵动 settings。
-  if (config.enabled === false) return;
-
-  const base = normalizeEntryConfig(config);
-  let mounted = false;
-  const mountOnce = (resolved) => {
-    if (mounted) return;
-    mounted = true;
-    mountWithConfig(ctx, resolved && typeof resolved === 'object' ? { ...base, ...resolved } : base);
-  };
-
-  // 无 inject 的宿主：直接以 entry config 挂载。
-  if (typeof ctx?.inject !== 'function') {
-    mountOnce(base);
-    return;
-  }
-
-  // 配置源接线严格遵循官方 `settings.installSection` 契约（实现见 dsh-settings，
-  // 用法见官方插件 dsh-tool-subagent/lib/model-selection-settings.js）。
-  //
-  // 关键：installSection 在接线完成后会**主动调用 hooks.onChange()**（dsh-settings
-  // lib/index.js:338），这就是官方给出的「配置已就位」通知点。插件在此读 source 即可
-  // 拿到三层合并结果，无需猜测任何时序。
-  //
-  // 实测踩过的坑，全部由此规避：
-  //   1. ctx.inject 回调**异步**执行，且晚于 setTimeout(0) 宏任务批次——任何固定延时
-  //      兜底都会抢跑，导致用户设置段静默失效（settings.yaml 填了 bucket 却报
-  //      bucket not configured）。
-  //   2. 「dsh-settings 包能否解析」也不可作判据：宿主共享层通常都装着它，
-  //      包存在 ≠ 本 profile 挂载了该服务。
-  //   3. settings 只能经 inject 后的 scoped context 访问；裸 ctx 上读 ctx.settings 会抛
-  //      "cannot get property settings without inject" 并拖垮整个 profile 启动。
-  //   4. settings 不能写进顶层 export const inject：cordis 的 inject 是阻塞式的
-  //      （Fiber._refresh：任一服务缺失 → epoch=INACTIVE → 永不 apply）。
-  let settingsSeen = false;
-  ctx.inject(['settings'], (settingsCtx) => {
-    settingsSeen = true;
-    const settings = settingsCtx?.settings;
-    if (settings == null || typeof settings.installSection !== 'function') {
-      mountOnce(base);
-      return;
-    }
-    let source = () => base;
-    try {
-      settings.installSection(ctx, SETTINGS_NS, Config, base, {
-        setSource: (next) => {
-          if (typeof next === 'function') source = next;
-        },
-        // 官方在接线完成后主动触发一次：此时 source 已指向 resolved scope。
-        // 契约 applies:'restart' → 首次用于挂载，后续变更只提示重启。
-        onChange: () => {
-          if (!mounted) {
-            mountOnce(source());
-            return;
-          }
-          console.warn("[memory-s3] settings changed; restart the profile to apply (applies: 'restart')");
-        },
-      });
-    } catch (error) {
-      // 注册失败绝不拖垮插件树：以 entry config 继续（官方容错语义）。
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`[memory-s3] settings section skipped (${message}); using entry config`);
-    }
-    // installSection 未按契约触发 onChange（宿主实现差异）时仍需挂载。
-    mountOnce(source());
-  });
-
-  // 本 profile 无 settings 提供者时上面的回调永不执行，插件会形同未安装。
-  // 这里**不使用**定时兜底（实测必抢跑），而是挂在 fiber 的 ready 事件上：
-  // 该事件在插件树全部就绪后触发，此时 settings 若仍未出现，即可断定它不存在。
+  if (cfg(config, 'enabled') === false) return;
+  // 宿主（cordis loader）已把 apply 的 config 解析为 schema 默认强化版，
+  // 此处归一化直入口：raw 侧（entry config 字面量/旧宿）+ resolved 侧（默认值已合入）
+  register(ctx, normalizeEntryConfig(config));
+  // 0.2.x 配置变更契约：非活字段变动 → Loader 重启 fiber（再演 apply）；
+  // 活字段变动 → loader/volatile-update（不重启，仅发事件）；本插件 listen 后
+  // 用 fiber.config 重写注册面（工具/审批/系统段/缓存/审计 全部换为最新配置）。
   if (typeof ctx.on === 'function') {
     try {
-      ctx.on('ready', () => {
-        if (!settingsSeen) mountOnce(base);
+      ctx.on('loader/volatile-update', () => {
+        try {
+          register(ctx, normalizeEntryConfig(ctx?.fiber?.config));
+        } catch (error) {
+          ctx.logger.error('[memory-s3] volatile config reload failed:');
+          ctx.logger.error(error);
+        }
       });
-    } catch {
-      // 宿主不支持 ready 事件：退化为立即以 entry config 挂载，保证插件可用。
-      mountOnce(base);
+    } catch (error) {
+      // 宿主不支持 volatile-update 事件：退化为 apply 的内建生命周期。
+      ctx.logger.warn(`[memory-s3] cannot listen to loader/volatile-update (${error})`);
     }
-  } else {
-    mountOnce(base);
   }
 }
 
 /**
- * 真正的挂载逻辑（原 apply 主体）：校验配置、构造 S3/缓存/审计、注册工具与注入。
- * @param {object} ctx - 插件上下文（可能是 inject 后的 scoped context）。
- * @param {object} resolved - 三层解析后的最终配置。
+ *  install：反注册本插件在该 ctx 上的全部注册，再用新 entry config 注册。
+ * @param {object} ctx - 插件上下文。
+ * @param {object} config - entry config（已合并用户设置段）。
  * @returns {void}
  */
-function mountWithConfig(ctx, resolved) {
-  if (resolved.enabled === false) return;
+function register(ctx, config) {
+  // 反注册：所有 doers 按依赖逆向顺序先释放——工具先消、听者后清。
+  const list = registered.get(ctx);
+  if (list) for (const dispose of registered.get(ctx).reverse()) dispose?.();
+  registered.delete(ctx);
+  if (cfg(config, 'enabled') === false) return;
+
+  const doers = [];
+  const track = (disposer) => {
+    doers.push(disposer);
+  };
+  mountWithConfig(ctx, config, track);
+  registered.set(ctx, doers);
+}
+
+/**
+ * 真正的挂载逻辑（原 apply 主体）：校验配置、构造 S3/缓存/审计、注册工具与注入。
+ * 所有注册会给 `track`，以支持配置热重载。
+ * @param {object} ctx - 插件上下文（可能是 inject 后的 scoped context）。
+ * @param {object} config - 已合并用户设置段的 entry config。
+ * @param {function} track - 注册 doers 的 accumulator（loader/volatile-update 热重载用）。
+ * @returns {void}
+ */
+function mountWithConfig(ctx, config, track) {
+  if (cfg(config, 'enabled') === false) return;
+  const bucket = cfg(config, 'bucket');
+  const endpoint = cfg(config, 'endpoint');
+  const region = cfg(config, 'region');
+  const prefix = cfg(config, 'prefix');
+  const writePolicy = cfg(config, 'writePolicy');
+  const snapshotOrder = cfg(config, 'snapshotOrder');
+  const maxInjectedItems = cfg(config, 'maxInjectedItems');
+  const importanceThreshold = cfg(config, 'importanceThreshold');
+  const accessKeyEnv = cfg(config, 'accessKeyEnv');
+  const secretKeyEnv = cfg(config, 'secretKeyEnv');
+  const sessionTokenEnv = cfg(config, 'sessionTokenEnv');
+  const cacheDir = cfg(config, 'cacheDir');
+  const auditRetentionDays = cfg(config, 'auditRetentionDays');
+  const maxFileBytes = cfg(config, 'maxFileBytes');
+  const allowedFileTypes = cfg(config, 'allowedFileTypes');
+  const embedder = cfg(config, 'embedder') ?? {};
 
   // bucket 未填 = 「已装但未配置」，不是错误：抛错会拖垮整个 profile 启动，用户连
   // GUI 设置页都进不去，也就永远没机会填这个值（死锁）。此处保持插件存活并待机——
-  // 命名空间已在 resolveRuntimeConfig 注册，设置页可见，填好 bucket 重启即生效。
-  if (typeof resolved.bucket !== 'string' || resolved.bucket.trim() === '') {
+  // 用户设置段写了就配，改后活重载。
+  if (typeof bucket !== 'string' || bucket.trim() === '') {
     console.warn(
       '[memory-s3] bucket not configured; plugin stands by (no tools/injection registered). ' +
-        `Set a bucket in the "${SETTINGS_NS}" settings section, then restart the profile.`,
+        'Set a bucket in the plugin config, then restart the profile.',
     );
     return;
   }
-  if (!['ask', 'auto', 'off'].includes(resolved.writePolicy)) {
-    throw invalidConfig(`writePolicy must be ask|auto|off (got ${JSON.stringify(resolved.writePolicy)})`);
+  if (!['ask', 'auto', 'off'].includes(writePolicy)) {
+    throw invalidConfig(`writePolicy must be ask|auto|off (got ${JSON.stringify(writePolicy)})`);
   }
-  if (!Number.isFinite(resolved.snapshotOrder)) throw invalidConfig('snapshotOrder must be a finite number');
-  if (!Number.isInteger(resolved.maxInjectedItems) || resolved.maxInjectedItems <= 0) {
+  if (!Number.isFinite(snapshotOrder)) throw invalidConfig('snapshotOrder must be a finite number');
+  if (!Number.isInteger(maxInjectedItems) || maxInjectedItems <= 0) {
     throw invalidConfig('maxInjectedItems must be a positive integer');
   }
-  if (!Number.isInteger(resolved.importanceThreshold) || resolved.importanceThreshold < 1 || resolved.importanceThreshold > 5) {
+  if (!Number.isInteger(importanceThreshold) || importanceThreshold < 1 || importanceThreshold > 5) {
     throw invalidConfig('importanceThreshold must be an integer in [1,5]');
   }
-  if (!Number.isInteger(resolved.auditRetentionDays) || resolved.auditRetentionDays < 0) {
+  if (!Number.isInteger(auditRetentionDays) || auditRetentionDays < 0) {
     throw invalidConfig('auditRetentionDays must be a non-negative integer');
   }
-  if (!Number.isFinite(resolved.maxFileBytes) || resolved.maxFileBytes <= 0) {
+  if (!Number.isFinite(maxFileBytes) || maxFileBytes <= 0) {
     throw invalidConfig('maxFileBytes must be a positive number');
   }
-  if (resolved.maxFileBytes > 100 * 1024 * 1024) {
+  if (maxFileBytes > 100 * 1024 * 1024) {
     console.warn('[memory-s3] maxFileBytes > 100MB — large attachments may exceed S3/network limits; keep objects small for reliable sync');
   }
-  if (resolved.allowedFileTypes.some((t) => typeof t !== 'string' || t === '')) {
+  if (allowedFileTypes.some((t) => typeof t !== 'string' || t === '')) {
     throw invalidConfig('allowedFileTypes must be an array of non-empty strings');
   }
-  if (resolved.endpoint !== '') {
-    if (!/^https?:\/\//.test(resolved.endpoint)) {
-      throw invalidConfig(`endpoint must start with https:// (or http:// for local MinIO only): ${resolved.endpoint}`);
-    }
-    if (resolved.endpoint.startsWith('http://')) {
-      console.warn('[memory-s3] endpoint uses http:// — plaintext transport, local MinIO only (SECURITY.md §5)');
-    }
+  if (endpoint !== '' && !/^https?:\/\//.test(endpoint)) {
+    throw invalidConfig(`endpoint must start with https:// (or http:// for local MinIO only): ${endpoint}`);
+  }
+  if (endpoint.startsWith('http://')) {
+    console.warn('[memory-s3] endpoint uses http:// — plaintext transport, local MinIO only (SECURITY.md §5)');
   }
 
   // 凭据探测（SECURITY.md §2）：仅环境变量，绝不落盘/入审计。
-  const accessKey = process.env[resolved.accessKeyEnv] ?? '';
-  const secretKey = process.env[resolved.secretKeyEnv] ?? '';
-  const sessionToken = process.env[resolved.sessionTokenEnv] ?? '';
+  const accessKey = process.env[accessKeyEnv] ?? '';
+  const secretKey = process.env[secretKeyEnv] ?? '';
+  const sessionToken = process.env[sessionTokenEnv] ?? '';
   const configured = accessKey !== '' && secretKey !== '';
   if (!configured) {
     console.warn(
-      `[memory-s3] credentials missing (${resolved.accessKeyEnv}/${resolved.secretKeyEnv}); ` +
+      `[memory-s3] credentials missing (${accessKeyEnv}/${secretKeyEnv}); ` +
         'plugin loads with reads-only/empty cache — status().configured=false',
     );
   }
 
   // 组装依赖（Provider 面）。
   const home = process.env.DSH_HOME ?? join(homedir(), '.deepseek-harness');
-  const cacheDir = resolved.cacheDir !== '' ? resolved.cacheDir : join(home, 'dsh-memory-s3', 'cache');
+  const cacheDirResolved = cacheDir !== '' ? cacheDir : join(home, 'dsh-memory-s3', 'cache');
   const s3 = createS3Store({
-    endpoint: resolved.endpoint !== '' ? resolved.endpoint : `https://s3.${resolved.region}.amazonaws.com`,
-    region: resolved.region,
-    bucket: resolved.bucket,
-    prefix: resolved.prefix,
+    endpoint: endpoint !== '' ? endpoint : `https://s3.${region}.amazonaws.com`,
+    region,
+    bucket,
+    prefix,
     accessKey,
     secretKey,
     sessionToken,
   });
-  const cache = createCache({ dir: cacheDir });
-  const audit = createAudit({ dir: cacheDir, retentionDays: resolved.auditRetentionDays });
-  const backlinks = createBacklinks({ dir: cacheDir });
-  const embedder = createEmbedder({
-    provider: resolved.embedder.provider,
-    endpoint: resolved.embedder.endpoint,
-    apiKey: process.env[resolved.embedder.apiKeyEnv] ?? '',
-    model: resolved.embedder.model,
-    dimensions: resolved.embedder.dimensions,
+  const cache = createCache({ dir: cacheDirResolved });
+  const audit = createAudit({ dir: cacheDirResolved, retentionDays: auditRetentionDays });
+  const backlinks = createBacklinks({ dir: cacheDirResolved });
+  const embedderSettings = createEmbedder({
+    provider: embedder.provider,
+    endpoint: embedder.endpoint,
+    apiKey: process.env[embedder.apiKeyEnv] ?? '',
+    model: embedder.model,
+    dimensions: embedder.dimensions,
   });
   const service = new MemoryS3Service({
     s3,
     cache,
     audit,
     backlinks,
-    embedder,
+    embedder: embedderSettings,
     approval: ctx.approval,
     config: {
-      writePolicy: resolved.writePolicy,
-      importanceThreshold: resolved.importanceThreshold,
-      maxInjectedItems: resolved.maxInjectedItems,
-      cacheDir,
+      writePolicy,
+      importanceThreshold,
+      maxInjectedItems,
+      cacheDir: cacheDirResolved,
       configured,
-      maxFileBytes: resolved.maxFileBytes,
-      allowedFileTypes: resolved.allowedFileTypes,
+      maxFileBytes,
+      allowedFileTypes,
     },
   });
 
   ctx.provide('memoryS3', service);
-  ctx.effect(() => () => {
+  track(ctx.effect(() => () => {
     // dispose：S3 客户端无连接句柄；cache/audit 为文件追加式，无资源需显式关闭。骨架无操作。
-  });
+  }));
 
   // 启动预热：插件加载后立即后台拉取一次远端记忆（fire-and-forget，不阻塞加载）。
   // 理由（ARCHITECTURE.md D1）：快照注入是同步的（rc.6 不 await 提供者），只读本地缓存投影；
@@ -1990,31 +1981,31 @@ function mountWithConfig(ctx, resolved) {
 
   // 审批 answerer：只认领本插件写请求（toolName 前缀 + reason 带 [dsh-memory-s3]）。
   // auto → 直接放行；off → 直接拒绝；ask → 交下游（UI）answerer。prepend 保证确定性先于 UI。
-  ctx.on(
+  track(ctx.on(
     'approval/request',
     async function answerer(req, next) {
       const toolName = req?.toolName;
       const reason = req?.reason;
       const ours = typeof toolName === 'string' && toolName.startsWith(TOOL_PREFIX) && isOwnReason(reason);
       if (!ours) return next();
-      if (resolved.writePolicy === 'auto') return 'allowed-once';
-      if (resolved.writePolicy === 'off') return 'rejected';
+      if (writePolicy === 'auto') return 'allowed-once';
+      if (writePolicy === 'off') return 'rejected';
       return next(); // ask：交给 UI answerer 裁决
     },
     { prepend: true },
-  );
+  ));
 
   for (const tool of makeMemoryTools(service)) {
-    ctx.tools.register(tool);
+    track(ctx.tools.register(tool));
   }
 
   // 冻结快照注入：会话首个 assemble 时同步渲染（text 回调内禁止 await），WeakMap 按
   // Session 冻结——会话内快照文本不变（ARCHITECTURE.md D3）。快照同时落 audit 行
   // （S2 可重建链的本地一链，同步 append 不违反同步提供者约束）。
   const snapshots = new WeakMap();
-  ctx.systemPrompt.section({
+  track(ctx.systemPrompt.section({
     name: 'dsh-memory-s3:memory',
-    order: resolved.snapshotOrder,
+    order: snapshotOrder,
     text: (assemble) => {
       const agent = assemble?.agent;
       const session = agent?.session;
@@ -2031,11 +2022,11 @@ function mountWithConfig(ctx, resolved) {
       }
       return frozen;
     },
-  });
+  }));
 
   // 会话事件观察（骨架阶段）：turn/end 且缓存为空 → 触发一次后台 sync（fire-and-forget，
   // 失败仅告警不阻塞会话）。不 append 任何自定义事件类型（rc.6 已知类型门）。
-  ctx.on('session/event', (session, event) => {
+  track(ctx.on('session/event', (session, event) => {
     const record = event;
     if (record === null || typeof record !== 'object') return;
     if (record.type !== 'turn/end') return;
@@ -2046,5 +2037,7 @@ function mountWithConfig(ctx, resolved) {
         const message = error instanceof Error ? error.message : String(error);
         console.warn(`[memory-s3] background sync failed: ${message}`);
       });
-  });
+  }));
 }
+
+
